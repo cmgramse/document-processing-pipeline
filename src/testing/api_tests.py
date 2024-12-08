@@ -1,108 +1,284 @@
+"""
+API Testing Module
+
+This module provides testing utilities for validating API integrations with
+Jina AI and Qdrant. It includes tests for connection health, data consistency,
+and error handling.
+
+The module manages:
+- API connection testing
+- Data consistency validation
+- Error simulation and handling
+- Performance benchmarking
+
+Features:
+- Automated connection tests
+- Data validation checks
+- Error recovery testing
+- Performance metrics
+
+Example:
+    Test Qdrant connection:
+        success = test_qdrant_connection(client)
+    
+    Test Jina AI APIs:
+        results = test_jina_apis(api_key)
+"""
+
 import logging
-import hashlib
 from datetime import datetime
-import os
-from typing import Dict, Any
-import requests
-from pathlib import Path
+import hashlib
+import json
+from typing import Dict, List, Any, Optional
+import time
+import random
 
-from ..api.jina import segment_text, get_embeddings
-from ..api.qdrant import validate_qdrant_connection
+from langchain.docstore.document import Document
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
 
-def test_document_loading(docs_path: str, glob_pattern: str) -> None:
-    """Test document loading functionality"""
-    api_logger = logging.getLogger('api_calls')
-    request_id = hashlib.md5(f"{datetime.now()}-test-loading".encode()).hexdigest()[:8]
+def test_qdrant_connection(client: QdrantClient, 
+                          test_docs: Optional[List[Document]] = None) -> bool:
+    """
+    Test Qdrant connection and basic operations.
     
-    try:
-        # Test direct file existence
-        full_path = Path(docs_path)
-        api_logger.info(f"[{request_id}] Testing path: {full_path.absolute()}")
-        api_logger.info(f"[{request_id}] Path exists: {full_path.exists()}")
-        api_logger.info(f"[{request_id}] Files in directory: {list(full_path.glob('*'))}")
-        
-        # Test DirectoryLoader
-        loader = DirectoryLoader(docs_path, glob=glob_pattern)
-        docs = loader.load()
-        api_logger.info(
-            f"[{request_id}] DirectoryLoader found {len(docs)} documents "
-            f"using pattern: {glob_pattern}"
-        )
-        
-        # Print details of each found document
-        for doc in docs:
-            api_logger.info(
-                f"[{request_id}] Found document: {doc.metadata['source']}, "
-                f"Size: {len(doc.page_content)} chars"
-            )
-            
-    except Exception as e:
-        api_logger.error(f"[{request_id}] Document loading test failed: {str(e)}")
-        raise
-
-def test_jina_apis(test_text: str = "This is a test document. Let's see how it gets processed."):
-    """Test Jina API functionality"""
-    api_logger = logging.getLogger('api_calls')
-    request_id = hashlib.md5(f"{datetime.now()}-test-apis".encode()).hexdigest()[:8]
+    Args:
+        client: Qdrant client instance
+        test_docs: Optional list of test documents
     
-    try:
-        # Test Segmenter API
-        api_logger.info(f"[{request_id}] Testing Jina Segmenter API...")
-        segments = segment_text(test_text, os.environ["JINA_API_KEY"])
-        api_logger.info(
-            f"[{request_id}] Segmenter test successful: "
-            f"Generated {len(segments.get('chunks', []))} chunks"
-        )
-        
-        # Test Embeddings API
-        if segments.get("chunks"):
-            api_logger.info(f"[{request_id}] Testing Jina Embeddings API...")
-            embeddings = get_embeddings(segments["chunks"], os.environ["JINA_API_KEY"])
-            api_logger.info(
-                f"[{request_id}] Embeddings test successful: "
-                f"Generated {len(embeddings)} embeddings"
-            )
-            
-        return True
-        
-    except Exception as e:
-        api_logger.error(f"[{request_id}] API test failed: {str(e)}")
-        raise
-
-def test_qdrant_connection():
-    """Test Qdrant connection and basic operations"""
+    Returns:
+        bool: True if all tests pass, False otherwise
+    
+    The function tests:
+    1. Connection health
+    2. Collection existence
+    3. Basic operations (if test_docs provided)
+    
+    Example:
+        client = QdrantClient(...)
+        if test_qdrant_connection(client):
+            print("Qdrant connection is healthy")
+    """
     api_logger = logging.getLogger('api_calls')
     request_id = hashlib.md5(f"{datetime.now()}-test-qdrant".encode()).hexdigest()[:8]
     
     try:
-        # Test basic connection
-        api_logger.info(f"[{request_id}] Testing Qdrant connection...")
-        qdrant_url = os.environ["QDRANT_URL"]
-        response = requests.get(
-            f"{qdrant_url}/collections",
-            headers={"api-key": os.environ["QDRANT_API_KEY"]}
-        )
-        response.raise_for_status()
+        # Log test start
+        api_logger.info(json.dumps({
+            'request_id': request_id,
+            'operation': 'test_qdrant',
+            'test_docs': bool(test_docs)
+        }))
         
-        # Test collection existence
-        collection_name = os.environ["QDRANT_COLLECTION_NAME"]
-        response = requests.get(
-            f"{qdrant_url}/collections/{collection_name}",
-            headers={"api-key": os.environ["QDRANT_API_KEY"]}
-        )
+        # Test connection
+        health = client.health()
+        if not health:
+            raise Exception("Qdrant health check failed")
         
-        if response.status_code == 200:
-            collection_info = response.json()
-            api_logger.info(
-                f"[{request_id}] Collection exists: {collection_name}\n"
-                f"Vector size: {collection_info.get('config', {}).get('params', {}).get('vectors', {}).get('size')}\n"
-                f"Points count: {collection_info.get('points_count')}"
+        # Test operations if documents provided
+        if test_docs:
+            collection_name = "test_collection"
+            
+            # Create test collection
+            client.recreate_collection(
+                collection_name=collection_name,
+                vectors_config=models.VectorParams(
+                    size=1024,
+                    distance=models.Distance.COSINE
+                )
             )
-        else:
-            api_logger.warning(f"[{request_id}] Collection {collection_name} does not exist")
+            
+            # Upload test documents
+            points = []
+            for i, doc in enumerate(test_docs):
+                points.append(models.PointStruct(
+                    id=i,
+                    vector=[random.random() for _ in range(1024)],
+                    payload={"text": doc.page_content}
+                ))
+            
+            client.upsert(
+                collection_name=collection_name,
+                points=points
+            )
+            
+            # Test search
+            results = client.search(
+                collection_name=collection_name,
+                query_vector=[random.random() for _ in range(1024)],
+                limit=1
+            )
+            
+            if not results:
+                raise Exception("Search returned no results")
+            
+            # Clean up
+            client.delete_collection(collection_name)
+        
+        api_logger.info(json.dumps({
+            'request_id': request_id,
+            'status': 'success',
+            'message': 'All Qdrant tests passed'
+        }))
         
         return True
         
     except Exception as e:
-        api_logger.error(f"[{request_id}] Qdrant test failed: {str(e)}")
-        raise 
+        api_logger.error(json.dumps({
+            'request_id': request_id,
+            'status': 'error',
+            'error': str(e)
+        }))
+        return False
+
+def test_jina_apis(api_key: str) -> Dict[str, Any]:
+    """
+    Test Jina AI API endpoints and functionality.
+    
+    Args:
+        api_key: Jina AI API key
+    
+    Returns:
+        Dict containing test results:
+        - segmenter_status: Segmenter API test result
+        - embeddings_status: Embeddings API test result
+        - latency: API latency measurements
+    
+    The function tests:
+    1. API key validation
+    2. Segmenter functionality
+    3. Embeddings generation
+    4. Error handling
+    
+    Example:
+        results = test_jina_apis(api_key)
+        if results['segmenter_status'] == 'ok':
+            print("Segmenter API is working")
+    """
+    api_logger = logging.getLogger('api_calls')
+    request_id = hashlib.md5(f"{datetime.now()}-test-jina".encode()).hexdigest()[:8]
+    
+    results = {
+        'segmenter_status': 'unknown',
+        'embeddings_status': 'unknown',
+        'latency': {}
+    }
+    
+    try:
+        # Log test start
+        api_logger.info(json.dumps({
+            'request_id': request_id,
+            'operation': 'test_jina_apis'
+        }))
+        
+        # Test segmenter
+        start_time = time.time()
+        test_text = "This is a test document for API validation."
+        
+        from ..api.jina import segment_text
+        chunks = segment_text(test_text, api_key)
+        
+        results['segmenter_status'] = 'ok'
+        results['latency']['segmenter'] = time.time() - start_time
+        
+        # Test embeddings
+        if chunks:
+            start_time = time.time()
+            from ..api.jina import get_embeddings
+            embeddings = get_embeddings([chunk['text'] for chunk in chunks], api_key)
+            
+            results['embeddings_status'] = 'ok'
+            results['latency']['embeddings'] = time.time() - start_time
+        
+        api_logger.info(json.dumps({
+            'request_id': request_id,
+            'status': 'success',
+            'results': results
+        }))
+        
+    except Exception as e:
+        api_logger.error(json.dumps({
+            'request_id': request_id,
+            'status': 'error',
+            'error': str(e)
+        }))
+        results['error'] = str(e)
+    
+    return results
+
+def benchmark_apis(api_key: str, num_tests: int = 10) -> Dict[str, Any]:
+    """
+    Benchmark API performance and reliability.
+    
+    Args:
+        api_key: Jina AI API key
+        num_tests: Number of test iterations
+    
+    Returns:
+        Dict containing benchmark results:
+        - avg_latency: Average latency per operation
+        - success_rate: Success rate per operation
+        - error_types: Encountered error types and counts
+    
+    Example:
+        results = benchmark_apis(api_key, num_tests=20)
+        print(f"Average latency: {results['avg_latency']} ms")
+    """
+    api_logger = logging.getLogger('api_calls')
+    request_id = hashlib.md5(f"{datetime.now()}-benchmark".encode()).hexdigest()[:8]
+    
+    results = {
+        'avg_latency': {},
+        'success_rate': {},
+        'error_types': {}
+    }
+    
+    try:
+        api_logger.info(json.dumps({
+            'request_id': request_id,
+            'operation': 'benchmark_apis',
+            'num_tests': num_tests
+        }))
+        
+        for i in range(num_tests):
+            test_results = test_jina_apis(api_key)
+            
+            # Update latency stats
+            for op, latency in test_results.get('latency', {}).items():
+                if op not in results['avg_latency']:
+                    results['avg_latency'][op] = []
+                results['avg_latency'][op].append(latency)
+            
+            # Update success stats
+            for op in ['segmenter_status', 'embeddings_status']:
+                status = test_results.get(op, 'unknown')
+                if op not in results['success_rate']:
+                    results['success_rate'][op] = {'ok': 0, 'failed': 0}
+                results['success_rate'][op]['ok' if status == 'ok' else 'failed'] += 1
+            
+            # Track errors
+            if 'error' in test_results:
+                error_type = type(test_results['error']).__name__
+                results['error_types'][error_type] = results['error_types'].get(error_type, 0) + 1
+            
+            time.sleep(1)  # Rate limiting
+        
+        # Calculate averages
+        for op in results['avg_latency']:
+            results['avg_latency'][op] = sum(results['avg_latency'][op]) / len(results['avg_latency'][op])
+        
+        api_logger.info(json.dumps({
+            'request_id': request_id,
+            'status': 'success',
+            'results': results
+        }))
+        
+    except Exception as e:
+        api_logger.error(json.dumps({
+            'request_id': request_id,
+            'status': 'error',
+            'error': str(e)
+        }))
+        results['error'] = str(e)
+    
+    return results

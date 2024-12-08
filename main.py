@@ -1,147 +1,268 @@
+"""
+Document Management System CLI Application
+
+This script provides a command-line interface for managing a document processing
+and storage system. It integrates with Jina AI for text processing and Qdrant
+for vector storage.
+
+Features:
+- Document processing with chunking and embedding generation
+- Document deletion and cleanup
+- Status reporting and statistics
+- Error recovery and batch processing
+
+Environment Variables Required:
+    JINA_API_KEY: API key for Jina AI
+    QDRANT_API_KEY: API key for Qdrant
+    QDRANT_URL: URL for Qdrant service
+    QDRANT_COLLECTION_NAME: Name of Qdrant collection
+
+Example Usage:
+    Process documents:
+        python main.py process
+    
+    Delete documents:
+        python main.py delete doc1.md doc2.md
+    
+    View statistics:
+        python main.py stats
+"""
+
 import os
+import sys
 import logging
 import argparse
-from pathlib import Path
-import random
-import hashlib
+from typing import List, Optional
 from datetime import datetime
 
-from src.config import setup_logging, check_environment
-from src.database.init import initialize_database
-from src.database.operations import get_database_stats
-from src.database.maintenance import cleanup_database
-from src.processing.documents import list_available_documents, select_documents, process_documents
+from src.processing.documents import (
+    list_available_documents,
+    select_documents,
+    process_documents
+)
 from src.api.qdrant import validate_qdrant_connection, initialize_qdrant
-from src.testing.api_tests import test_qdrant_connection, test_jina_apis
+from src.database.init import initialize_database
+from src.database.maintenance import cleanup_database
 from src.management.document_manager import DocumentManager
 
+def setup_logging() -> None:
+    """
+    Configure logging for the application.
+    
+    Sets up logging handlers for:
+    - Console output (INFO level)
+    - File output (DEBUG level)
+    - API calls tracking
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('app.log', mode='w')
+        ]
+    )
+
+def validate_environment() -> bool:
+    """
+    Validate required environment variables and connections.
+    
+    Checks:
+    - Required API keys are set
+    - Database connection is working
+    - Qdrant connection is working
+    
+    Returns:
+        bool: True if all validations pass, False otherwise
+    """
+    required_env_vars = ['JINA_API_KEY', 'QDRANT_API_KEY', 'QDRANT_URL', 'QDRANT_COLLECTION_NAME']
+    for var in required_env_vars:
+        if not os.environ.get(var):
+            logging.error(f"Missing required environment variable: {var}")
+            return False
+    
+    # Validate database connection
+    try:
+        initialize_database()
+    except Exception as e:
+        logging.error(f"Failed to connect to database: {str(e)}")
+        return False
+    
+    # Validate Qdrant connection
+    try:
+        validate_qdrant_connection()
+    except Exception as e:
+        logging.error(f"Failed to connect to Qdrant: {str(e)}")
+        return False
+    
+    return True
+
+def process_command(args: argparse.Namespace) -> None:
+    """
+    Handle the process command for document processing.
+    
+    Args:
+        args: Command line arguments
+    
+    This function:
+    1. Lists available documents
+    2. Allows document selection
+    3. Processes selected documents
+    4. Updates processing status
+    """
+    available_docs = list_available_documents()
+    selected_docs = select_documents(available_docs)
+    
+    if not selected_docs:
+        logging.info("No documents selected for processing")
+        return
+    
+    doc_manager = DocumentManager(initialize_database())
+    qdrant_client = validate_qdrant_connection()
+    
+    if not qdrant_client:
+        logging.error("Failed to connect to Qdrant")
+        return
+    
+    doc_manager.qdrant_client = qdrant_client
+    
+    process_documents(selected_docs, doc_manager)
+
+def delete_command(args: argparse.Namespace) -> None:
+    """
+    Handle the delete command for document removal.
+    
+    Args:
+        args: Command line arguments containing documents to delete
+    
+    This function:
+    1. Validates documents exist
+    2. Removes documents from database
+    3. Removes vectors from Qdrant
+    4. Updates deletion status
+    """
+    doc_manager = DocumentManager(initialize_database())
+    qdrant_client = validate_qdrant_connection()
+    
+    if not qdrant_client:
+        logging.error("Failed to connect to Qdrant")
+        return
+    
+    doc_manager.qdrant_client = qdrant_client
+    
+    for doc in args.documents:
+        if doc_manager.delete_document(doc):
+            logging.info(f"Successfully deleted {doc}")
+        else:
+            logging.error(f"Failed to delete {doc}")
+
+def stats_command(args: argparse.Namespace) -> None:
+    """
+    Handle the stats command for viewing system statistics.
+    
+    Args:
+        args: Command line arguments
+    
+    Displays:
+    - Total documents processed
+    - Processing success rate
+    - Storage usage
+    - Recent operations
+    """
+    doc_manager = DocumentManager(initialize_database())
+    stats = doc_manager.get_system_stats()
+    
+    if not stats:
+        logging.info("No system statistics available")
+        return
+    
+    for key, value in stats.items():
+        logging.info(f"{key}: {value}")
+
+def cleanup_command(args: argparse.Namespace) -> None:
+    """
+    Handle the cleanup command for system maintenance.
+    
+    Args:
+        args: Command line arguments
+    
+    This function:
+    1. Removes orphaned chunks
+    2. Optimizes database
+    3. Synchronizes with Qdrant
+    """
+    doc_manager = DocumentManager(initialize_database())
+    qdrant_client = validate_qdrant_connection()
+    
+    if not qdrant_client:
+        logging.error("Failed to connect to Qdrant")
+        return
+    
+    doc_manager.qdrant_client = qdrant_client
+    
+    if args.dry_run:
+        logging.info("Dry run mode, no changes will be made")
+    
+    cleanup_database(doc_manager, args.dry_run)
+
 def main():
-    parser = argparse.ArgumentParser(description='Document processing and management system')
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    """
+    Main entry point for the document management system.
+    
+    Handles command line argument parsing and routes to appropriate
+    command handlers. Sets up logging and validates environment
+    before executing commands.
+    
+    Commands:
+        process: Process new documents
+        delete: Remove existing documents
+        stats: View system statistics
+        cleanup: Perform system maintenance
+    """
+    parser = argparse.ArgumentParser(
+        description='Document Management System'
+    )
+    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
     
     # Process command
-    process_parser = subparsers.add_parser('process', help='Process and upload documents')
-    process_parser.add_argument('--force-reprocess', nargs='*', help='Force reprocess specific files or all if no files specified')
+    process_parser = subparsers.add_parser('process', help='Process documents')
+    process_parser.add_argument('--force', action='store_true', 
+                              help='Force reprocessing of documents')
     
     # Delete command
     delete_parser = subparsers.add_parser('delete', help='Delete documents')
-    delete_parser.add_argument('files', nargs='*', help='Files to delete')
-    delete_parser.add_argument('--force', action='store_true', help='Force delete even if referenced')
-    
-    # Cleanup command
-    cleanup_parser = subparsers.add_parser('cleanup', help='Clean up old processed chunks')
-    cleanup_parser.add_argument('--retention-days', type=int, default=30, help='Number of days to retain processed chunks')
+    delete_parser.add_argument('documents', nargs='+', help='Documents to delete')
     
     # Stats command
-    stats_parser = subparsers.add_parser('stats', help='Show document statistics')
-    stats_parser.add_argument('files', nargs='*', help='Files to show stats for (empty for all)')
+    subparsers.add_parser('stats', help='View system statistics')
+    
+    # Cleanup command
+    cleanup_parser = subparsers.add_parser('cleanup', help='Clean up system')
+    cleanup_parser.add_argument('--dry-run', action='store_true',
+                              help='Show what would be done without making changes')
     
     args = parser.parse_args()
     
-    try:
-        # Setup enhanced logging
-        api_logger = setup_logging()
-        logging.info("Starting document management system")
-        
-        # Check environment
-        check_environment()
-        
-        # Initialize database connection
-        conn = initialize_database()
-        
-        # Initialize document manager
-        doc_manager = DocumentManager(conn)
-        
-        if args.command == 'cleanup':
-            stats = cleanup_database(conn, args.retention_days)
-            logging.info(f"Cleanup completed: {stats}")
-            return
-            
-        elif args.command == 'delete':
-            if not args.files:
-                available_docs = list_available_documents()
-                print("\nSelect documents to delete:")
-                args.files = doc_manager.batch_process_documents(available_docs)
-            
-            for file in args.files:
-                if doc_manager.delete_document(file, args.force):
-                    print(f"Successfully deleted {file}")
-                else:
-                    print(f"Failed to delete {file}")
-            return
-            
-        elif args.command == 'stats':
-            available_docs = list_available_documents()
-            if not args.files:
-                args.files = available_docs
-            
-            print("\nDocument Statistics:")
-            for file in args.files:
-                stats = doc_manager.get_document_stats(file)
-                if stats:
-                    print(f"\n{file}:")
-                    for key, value in stats.items():
-                        print(f"  {key}: {value}")
-            return
-            
-        elif args.command == 'process' or not args.command:
-            # Validate Qdrant connection
-            qdrant_client = validate_qdrant_connection()
-            if not qdrant_client:
-                raise ConnectionError("Could not connect to Qdrant server")
-            
-            # Update document manager with Qdrant client
-            doc_manager.qdrant_client = qdrant_client
-            
-            # List and select documents
-            available_docs = list_available_documents()
-            if not available_docs:
-                logging.warning("No documents found in docs directory")
-                return
-                
-            print("\nSelect documents to process:")
-            selected_docs = doc_manager.batch_process_documents(available_docs)
-            if not selected_docs:
-                logging.info("No documents selected for processing")
-                return
-            
-            # Handle existing documents
-            to_process = []
-            for doc in selected_docs:
-                if doc_manager.handle_existing_document(doc):
-                    to_process.append(doc)
-            
-            if not to_process:
-                logging.info("No documents to process after handling existing files")
-                return
-            
-            # Process documents
-            documents, stats = process_documents(to_process, conn, args.force_reprocess)
-            
-            if documents:
-                # Initialize Qdrant and upload pending documents
-                qdrant = initialize_qdrant(conn)
-                if qdrant:
-                    logging.info("Successfully uploaded pending documents to Qdrant")
-                    
-                    # Verify random samples
-                    num_samples = min(5, len(documents))
-                    if num_samples > 0:
-                        samples = random.sample(documents, num_samples)
-                        test_qdrant_connection(qdrant, samples)
-            
-            # Show processing statistics
-            print("\nProcessing Statistics:")
-            for key, value in stats.items():
-                print(f"{key}: {value}")
-        
-    except Exception as e:
-        logging.error(f"Error: {str(e)}")
-        raise
+    setup_logging()
     
-    finally:
-        if conn:
-            conn.close()
+    if not validate_environment():
+        sys.exit(1)
+    
+    try:
+        if args.command == 'process':
+            process_command(args)
+        elif args.command == 'delete':
+            delete_command(args)
+        elif args.command == 'stats':
+            stats_command(args)
+        elif args.command == 'cleanup':
+            cleanup_command(args)
+        else:
+            parser.print_help()
+            sys.exit(1)
+    except Exception as e:
+        logging.error(f"Error executing command: {str(e)}")
+        sys.exit(1)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

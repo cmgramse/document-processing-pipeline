@@ -1,5 +1,6 @@
 """Document management functionality for handling document lifecycle."""
 import logging
+import os
 from typing import List, Tuple, Optional
 from datetime import datetime
 import hashlib
@@ -25,10 +26,7 @@ class DocumentManager:
         return (True, result[0]) if result else (False, None)
     
     def delete_document(self, filename: str, force: bool = False) -> bool:
-        """
-        Delete a document and all its associated data.
-        Returns True if successful.
-        """
+        """Delete a document and its associated chunks."""
         try:
             c = self.conn.cursor()
             
@@ -44,35 +42,52 @@ class DocumentManager:
             if not force:
                 # Check if document is referenced elsewhere
                 c.execute("""
-                    SELECT COUNT(*) FROM document_references 
-                    WHERE source_doc = ? OR target_doc = ?
-                """, (filename, filename))
-                ref_count = c.fetchone()[0]
-                if ref_count > 0:
-                    logging.warning(f"Document {filename} has {ref_count} references")
-                    if not force:
-                        return False
+                    SELECT name FROM sqlite_master 
+                    WHERE type='table' AND name='document_references'
+                """)
+                if c.fetchone():
+                    c.execute("""
+                        SELECT COUNT(*) FROM document_references 
+                        WHERE source_doc_id IN (
+                            SELECT id FROM documents WHERE filename = ?
+                        ) OR target_doc_id IN (
+                            SELECT id FROM documents WHERE filename = ?
+                        )
+                    """, (filename, filename))
+                    ref_count = c.fetchone()[0]
+                    if ref_count > 0:
+                        logging.warning(f"Document {filename} has {ref_count} references")
+                        if not force:
+                            return False
             
             # Delete from Qdrant
             if self.qdrant_client and doc_ids:
-                delete_vectors_by_filter(
-                    self.qdrant_client,
-                    self.collection_name,
-                    {"must": [{"id": {"in": doc_ids}}]}
-                )
+                self.qdrant_client.delete_vectors_by_filter({"must": [{"id": {"in": doc_ids}}]})
             
-            # Delete from SQLite
-            c.execute("DELETE FROM chunks WHERE filename = ?", (filename,))
-            c.execute("DELETE FROM documents WHERE chunk_id IN ({})".format(
-                ','.join('?' * len(chunk_ids))), chunk_ids)
-            c.execute("DELETE FROM processed_files WHERE filename = ?", (filename,))
-            
-            # Delete references if forcing
-            if force:
+            # Delete document references if table exists
+            c.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name='document_references'
+            """)
+            if c.fetchone():
                 c.execute("""
                     DELETE FROM document_references 
-                    WHERE source_doc = ? OR target_doc = ?
+                    WHERE source_doc_id IN (
+                        SELECT id FROM documents WHERE filename = ?
+                    ) OR target_doc_id IN (
+                        SELECT id FROM documents WHERE filename = ?
+                    )
                 """, (filename, filename))
+                
+            # Delete from documents
+            c.execute("DELETE FROM documents WHERE chunk_id IN ({})".format(
+                ','.join('?' * len(chunk_ids))), chunk_ids)
+            
+            # Delete from chunks
+            c.execute("DELETE FROM chunks WHERE filename = ?", (filename,))
+            
+            # Delete from processed_files
+            c.execute("DELETE FROM processed_files WHERE filename = ?", (filename,))
             
             self.conn.commit()
             logging.info(f"Successfully deleted document {filename} and all associated data")
@@ -219,7 +234,7 @@ class DocumentManager:
         c.execute("""
             SELECT 
                 COUNT(*) as total_vectors,
-                SUM(CASE WHEN qdrant_status = 'uploaded' THEN 1 ELSE 0 END) as uploaded_vectors
+                SUM(CASE WHEN status = 'uploaded' THEN 1 ELSE 0 END) as uploaded_vectors
             FROM documents 
             WHERE filename = ?
         """, (filename,))

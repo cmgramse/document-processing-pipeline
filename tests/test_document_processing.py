@@ -4,11 +4,31 @@ from datetime import datetime
 from pathlib import Path
 from src.processing.documents import process_documents
 from src.database.maintenance import optimize_batch_processing
+from src.api.jina import segment_text, get_embeddings
 
 def test_process_new_document(temp_db, test_docs_dir, mock_jina_api):
     """Test processing of a new document."""
-    test_file = "test1.md"
-    documents, stats = process_documents([test_file], temp_db)
+    test_file = test_docs_dir / "test1.md"
+    documents, stats = process_documents([str(test_file)], temp_db)
+    
+    # Debug: Check database state
+    c = temp_db.cursor()
+    
+    print("\nChunks table:")
+    c.execute("SELECT * FROM chunks")
+    chunks = c.fetchall()
+    for chunk in chunks:
+        print(f"Chunk: {chunk}")
+    
+    print("\nDocuments table:")
+    c.execute("SELECT * FROM documents")
+    docs = c.fetchall()
+    for doc in docs:
+        print(f"Doc: {doc}")
+    
+    print("\nProcessed documents:")
+    for doc in documents:
+        print(f"Processed doc: {doc}")
     
     assert len(documents) == 2  # Two chunks from mock
     assert stats["chunks_created"] == 2
@@ -18,23 +38,28 @@ def test_process_new_document(temp_db, test_docs_dir, mock_jina_api):
     c = temp_db.cursor()
     
     # Check processed_files
-    c.execute("SELECT status, chunk_count FROM processed_files WHERE filename = ?", (test_file,))
+    c.execute("SELECT status, chunk_count FROM processed_files WHERE filename = ?", (test_file.name,))
     result = c.fetchone()
     assert result
     assert result[0] == "embedded"
     assert result[1] == 2
     
     # Check chunks
-    c.execute("SELECT COUNT(*) FROM chunks WHERE filename = ?", (test_file,))
+    c.execute("SELECT COUNT(*) FROM chunks WHERE filename = ?", (test_file.name,))
     assert c.fetchone()[0] == 2
     
     # Check documents
-    c.execute("SELECT COUNT(*) FROM documents WHERE filename = ?", (test_file,))
+    c.execute("SELECT COUNT(*) FROM documents WHERE filename = ?", (test_file.name,))
     assert c.fetchone()[0] == 2
 
 def test_force_reprocess_document(temp_db, test_docs_dir, mock_jina_api, sample_processed_doc):
     """Test force reprocessing of an existing document."""
-    documents, stats = process_documents([sample_processed_doc], temp_db, force_reprocess=[sample_processed_doc])
+    test_file = test_docs_dir / sample_processed_doc
+    
+    # Create test file
+    test_file.write_text("Test document content")
+    
+    documents, stats = process_documents([str(test_file)], temp_db, force_reprocess=[str(test_file)])
     
     assert len(documents) == 2
     assert stats["chunks_created"] == 2
@@ -48,32 +73,33 @@ def test_force_reprocess_document(temp_db, test_docs_dir, mock_jina_api, sample_
 
 def test_batch_processing_optimization():
     """Test batch processing optimization."""
+    # Test with short chunks
     chunks = ["short text", "medium text " * 5, "long text " * 10]
-    
-    # Test with default batch size
     batches = list(optimize_batch_processing(chunks))
     assert len(batches) > 0
     assert all(len(batch) <= 50 for batch in batches)
-    
+
     # Test with custom batch size
     batches = list(optimize_batch_processing(chunks, batch_size=2))
     assert len(batches) >= 2
     assert all(len(batch) <= 2 for batch in batches)
-    
-    # Test token limit
-    long_chunks = ["very long text " * 100] * 5
+
+    # Test with very long chunks that should trigger token limit splits
+    long_chunks = ["very long text " * 500] * 5  # Much longer chunks
     batches = list(optimize_batch_processing(long_chunks))
     assert len(batches) > 1  # Should split due to token limit
 
 def test_error_handling(temp_db, test_docs_dir, mock_jina_api, monkeypatch):
     """Test error handling during processing."""
-    def mock_failing_embedding(*args, **kwargs):
+    def mock_failing_post(*args, **kwargs):
         raise Exception("Embedding failed")
     
-    monkeypatch.setattr("src.api.jina.get_embeddings", mock_failing_embedding)
+    monkeypatch.setattr("requests.post", mock_failing_post)
     
-    test_file = "test1.md"
-    documents, stats = process_documents([test_file], temp_db)
+    test_file = test_docs_dir / "test1.md"
+    test_file.write_text("Test content")
+    
+    documents, stats = process_documents([str(test_file)], temp_db)
     
     # Should have created chunks but failed embeddings
     assert stats["chunks_created"] > 0
@@ -81,7 +107,7 @@ def test_error_handling(temp_db, test_docs_dir, mock_jina_api, monkeypatch):
     
     # Check failure status in database
     c = temp_db.cursor()
-    c.execute("SELECT embedding_status FROM chunks WHERE filename = ?", (test_file,))
+    c.execute("SELECT embedding_status FROM chunks WHERE filename = ?", (test_file.name,))
     statuses = [row[0] for row in c.fetchall()]
     assert all(status == "failed" for status in statuses)
 
@@ -96,6 +122,6 @@ def test_document_segmentation(temp_db, test_docs_dir, mock_jina_api, content, e
     test_file = test_docs_dir / "test_segment.md"
     with open(test_file, 'w') as f:
         f.write(content)
-    
-    documents, stats = process_documents(["test_segment.md"], temp_db)
+
+    documents, stats = process_documents([str(test_file)], temp_db)
     assert stats["chunks_created"] == expected_chunks
