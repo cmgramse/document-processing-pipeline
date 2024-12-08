@@ -158,3 +158,11 @@ class ProcessingStats:
             stats['avg_batch_size'] = sum(self.batch_sizes) / len(self.batch_sizes)
         
         return stats
+    
+    def __str__(self):
+        return (
+            f"Files processed: {self.files_processed}\n"
+            f"Chunks created: {self.chunks_created}\n"
+            f"Embeddings generated: {self.embeddings_generated}\n"
+            f"Errors: {self.errors}"
+        )

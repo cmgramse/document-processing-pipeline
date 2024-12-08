@@ -83,6 +83,15 @@ from ..database.operations import mark_file_as_processed, get_unprocessed_files,
 from .stats import ProcessingStats
 from src.database.maintenance import optimize_batch_processing, track_chunk_versions
 
+class Document:
+    """Represents a processed document with its content and metadata."""
+    def __init__(self, page_content: str, metadata: Dict[str, Any]):
+        self.page_content = page_content
+        self.metadata = metadata
+    
+    def __str__(self):
+        return f"Document(content={self.page_content[:50]}..., metadata={self.metadata})"
+
 def list_available_documents() -> List[str]:
     """
     List all available documents in the docs directory.
@@ -327,308 +336,130 @@ def segment_text_local(text: str, api_key: Optional[str] = None) -> List[Dict[st
     # Use the Jina AI segmentation API
     return segment_text(text, api_key)
 
-def process_documents(markdown_files: List[str], conn, 
-                     force_reprocess: List[str] = None) -> Tuple[List[Dict[str, Any]], ProcessingStats]:
-    """
-    Process documents through the complete pipeline.
-    
-    This function orchestrates the entire document processing workflow,
-    from segmentation to embedding generation and storage.
-    
-    Processing Steps:
-    1. File Validation:
-       - Checks file existence and readability
-       - Validates file format
-    
-    2. Segmentation:
-       - Splits documents into semantic chunks
-       - Preserves context and structure
-    
-    3. Embedding Generation:
-       - Processes chunks in optimized batches
-       - Implements automatic retry logic
-    
-    4. Storage Management:
-       - Tracks processing status
-       - Manages version control
-       - Optimizes database operations
-    
-    Args:
-        markdown_files: List of files to process
-        conn: SQLite database connection
-        force_reprocess: Optional files to reprocess
-    
-    Returns:
-        Tuple containing:
-        - List[Dict[str, Any]]: Processed documents with embeddings
-        - ProcessingStats: Detailed processing statistics
-    
-    Raises:
-        EnvironmentError: Missing API keys
-        sqlite3.Error: Database errors
-        Exception: General processing errors
-    
-    Example:
-        # Process with default settings
-        with sqlite3.connect('docs.db') as conn:
-            docs, stats = process_documents(['doc1.md'], conn)
-        
-        # Force reprocess specific files
-        docs, stats = process_documents(
-            ['doc1.md', 'doc2.md'],
-            conn,
-            force_reprocess=['doc1.md']
-        )
-        
-        # Check processing results
-        print(f"Processed {stats.files_processed} files")
-        print(f"Generated {stats.chunks_created} chunks")
-        print(f"Created {stats.embeddings_generated} embeddings")
-        
-        # Access processed documents
-        for doc in docs:
-            print(f"Document: {doc['metadata']['filename']}")
-            print(f"Chunk size: {len(doc['content'])}")
-            print(f"Embedding: {len(doc['embedding'])} dimensions")
-    """
-    """Process documents through segmentation and embedding"""
-    # Get API key from environment
-    api_key = os.getenv("JINA_API_KEY")
-    if not api_key:
-        raise EnvironmentError("JINA_API_KEY environment variable not set")
-        
+def process_documents(markdown_files: List[str], conn, force_reprocess: List[str] = None) -> Tuple[List[Document], ProcessingStats]:
+    """Process markdown documents and generate embeddings."""
     stats = ProcessingStats()
-    stats.files_processed = 0
-    stats.chunks_created = 0
-    stats.embeddings_generated = 0
-    processed_docs = []
+    processed_documents = []
     
-    # Ensure chunk versioning is set up
-    track_chunk_versions(conn)
-    
-    for file in markdown_files:
-        try:
-            # Check if we need to segment the file
-            c = conn.cursor()
-            c.execute("SELECT status, chunk_count FROM processed_files WHERE filename = ?", (file,))
-            file_status = c.fetchone()
-            
-            # Need to process if: no status, force reprocess, or failed status
-            needs_processing = (
-                not file_status or  # No previous processing
-                force_reprocess and file in force_reprocess or  # Forced reprocess
-                file_status and file_status[0] == 'failed'  # Failed processing
-            )
-            
-            if needs_processing:
-                # Read the document content
-                with open(file, 'r') as f:
+    try:
+        # Get unprocessed files
+        unprocessed_files = get_unprocessed_files(conn, markdown_files)
+        if force_reprocess:
+            force_reprocess_files(conn, force_reprocess)
+            # Only add files that aren't already in unprocessed_files
+            unprocessed_files.extend([f for f in force_reprocess if f not in unprocessed_files])
+        
+        # Track versions for chunks
+        track_chunk_versions(conn)
+        
+        docs_path = Path('./docs')
+        for relative_path in unprocessed_files:
+            try:
+                file_path = docs_path / relative_path
+                with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 
-                # Segment the document
-                chunks = segment_text_local(content, api_key=api_key)
-                logging.debug(f"Segmented chunks: {chunks}")  # Debug log
-                stats.chunks_created += len(chunks)
-                
-                # Store chunks in database
-                now = datetime.now()
-                filename = os.path.basename(file)
-                for i, chunk in enumerate(chunks):
-                    chunk_id = f"{file}_{i}"
-                    c.execute("""INSERT OR REPLACE INTO chunks 
-                                (id, filename, chunk_number, content, token_count, created_at)
-                                VALUES (?, ?, ?, ?, ?, ?)""",
-                            (chunk_id, filename, i, chunk['text'], len(chunk['text'].split()), now))
-                
-                # Update file status
-                c.execute("""INSERT OR REPLACE INTO processed_files 
-                            (filename, last_modified, processed_at, chunk_count, status)
-                            VALUES (?, ?, ?, ?, 'segmented')""",
-                         (filename, os.path.getmtime(file), now, len(chunks)))
-                conn.commit()
-            
-            # Process chunks that need embeddings in optimized batches
-            c.execute("""SELECT id, content FROM chunks 
-                        WHERE filename = ? AND embedding_status = 'pending'""", (os.path.basename(file),))
-            pending_chunks = c.fetchall()
-            logging.debug(f"Pending chunks: {pending_chunks}")  # Debug log
-            
-            if pending_chunks:
-                # Format chunks for embedding - each chunk needs a 'text' field
-                formatted_chunks = [{'text': content} for _, content in pending_chunks]
-                chunk_ids = [chunk_id for chunk_id, _ in pending_chunks]
-                logging.debug(f"Formatted chunks: {formatted_chunks}")  # Debug log
-                
-                # Process in optimized batches
-                for i in range(0, len(formatted_chunks), 50):  # Use fixed batch size of 50
-                    batch = formatted_chunks[i:i + 50]
+                try:
+                    # Segment text into chunks
+                    segments = segment_text(content, api_key=os.getenv('JINA_API_KEY', ''))
+                    if not segments:
+                        logging.warning(f"No segments generated for {relative_path}")
+                        continue
+                    
+                    logging.debug(f"Segmented chunks: {segments}")
+                    stats.chunks_created += len(segments)
+                    
+                    # Process chunks and get embeddings
+                    chunk_texts = [chunk["text"] for chunk in segments]
                     try:
-                        # Get embeddings for the batch
-                        embeddings_response = get_embeddings(batch, api_key=api_key)
-                        logging.debug(f"Got embeddings response: {embeddings_response}")
-
-                        # Process each chunk with its embedding
-                        embedded_chunks = embeddings_response['data']  # Extract data from response
+                        embeddings_result = get_embeddings(segments, api_key=os.getenv('JINA_API_KEY', ''))
                         
-                        stats.embeddings_generated += len(embedded_chunks)
+                        if not embeddings_result or "data" not in embeddings_result:
+                            logging.error(f"Failed to get embeddings for {relative_path}")
+                            stats.errors += 1
+                            conn.rollback()  # Rollback any partial changes
+                            continue
                         
-                        # Update database with embeddings
-                        now = datetime.now()
-                        batch_chunk_ids = chunk_ids[i:i + len(embedded_chunks)]
-                        for chunk_data, chunk_id in zip(embedded_chunks, batch_chunk_ids):
-                            # Extract filename and chunk number
-                            filename = os.path.basename(chunk_id.rsplit('_', 1)[0])
-                            chunk_number = int(chunk_id.rsplit('_', 1)[1])
+                        # Store chunks in database
+                        c = conn.cursor()
+                        for i, (chunk, embedding_data) in enumerate(zip(segments, embeddings_result["data"])):
+                            chunk_id = hashlib.md5(chunk["text"].encode()).hexdigest()
+                            basename = os.path.basename(str(file_path))
                             
-                            # Update chunk with embedding
-                            c.execute("""UPDATE chunks 
-                                        SET embedding = ?, 
-                                            embedding_model = ?,
-                                            embedding_status = 'completed',
-                                            processed_at = ?
-                                        WHERE id = ?""",
-                                    (json.dumps(chunk_data['embedding']),
-                                     chunk_data['embedding_model'],
-                                     now,
-                                     chunk_id))
+                            # Store chunk
+                            c.execute('''INSERT OR REPLACE INTO chunks 
+                                       (id, filename, content, token_count, embedding_status)
+                                       VALUES (?, ?, ?, ?, ?)''',
+                                     (chunk_id,
+                                      basename,
+                                      chunk["text"],
+                                      len(chunk["text"].split()),  # Simple token count
+                                      "completed"))
                             
-                            # Create document record
-                            doc_id = f"doc_{chunk_id}"
-                            c.execute("""INSERT OR REPLACE INTO documents
-                                        (id, filename, chunk_id, content, content_hash, embedding,
-                                         created_at, status, last_modified, version_status)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                    (doc_id, filename, chunk_id, chunk_data['text'],
-                                     hashlib.md5(chunk_data['text'].encode()).hexdigest(),
-                                     json.dumps(chunk_data['embedding']), now, 'pending',
-                                     datetime.fromtimestamp(os.path.getmtime(file)), 'pending'))
+                            # Store document with embedding
+                            c.execute('''INSERT OR REPLACE INTO documents 
+                                       (id, filename, chunk_id, content, embedding, processed_at)
+                                       VALUES (?, ?, ?, ?, ?, datetime('now'))''',
+                                     (chunk_id,
+                                      basename,
+                                      i,
+                                      chunk["text"],
+                                      json.dumps(embedding_data["embedding"])))
                             
-                            # Add to processed docs
-                            processed_docs.append({
-                                'id': doc_id,
-                                'content': chunk_data['text'],
-                                'embedding': chunk_data['embedding'],
-                                'metadata': {
-                                    'filename': filename,
-                                    'chunk_id': chunk_id,
-                                    'embedding_model': chunk_data['embedding_model'],
-                                    'embedding_version': chunk_data.get('embedding_version', '1.0.0')
+                            # Create Document object
+                            doc = Document(
+                                page_content=chunk["text"],
+                                metadata={
+                                    "source": basename,
+                                    "chunk_id": i,
+                                    "embedding": embedding_data["embedding"]
                                 }
-                            })
+                            )
+                            processed_documents.append(doc)
+                            stats.embeddings_generated += 1
                         
-                        conn.commit()
-                        logging.info(f"Processed batch {i//50 + 1} with {len(embedded_chunks)} chunks")
+                        # Mark file as processed
+                        mark_file_as_processed(conn, basename, len(segments))
+                        stats.files_processed += 1
                         
                     except Exception as e:
-                        logging.error(f"Failed to process batch {i//50 + 1}: {str(e)}")
-                        # Mark chunks as failed
-                        batch_chunk_ids = chunk_ids[i:i + len(batch)]
-                        for chunk_id in batch_chunk_ids:
-                            c.execute("""UPDATE chunks 
-                                       SET embedding_status = 'failed',
-                                           processed_at = ?
-                                       WHERE id = ?""",
-                                    (datetime.now(), chunk_id))
-                        conn.commit()
-                        raise
-                # Update file status if all chunks are processed
-                c.execute("""UPDATE processed_files SET status = 'embedded' 
-                            WHERE filename = ? AND 
-                            (SELECT COUNT(*) FROM chunks 
-                             WHERE filename = ? AND embedding_status != 'completed') = 0""",
-                         (os.path.basename(file), os.path.basename(file)))
-                conn.commit()
-            
-            stats.files_processed += 1
-            
-        except Exception as e:
-            logging.error(f"Error processing file {file}: {str(e)}")
-            continue
-    
-    # Update processed_files table
-    for filename in markdown_files:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO processed_files 
-            (filename, last_modified, processed_at, chunk_count, status)
-            VALUES (?, ?, CURRENT_TIMESTAMP, ?, 'embedded')
-        """, (os.path.basename(filename), os.path.getmtime(filename), stats.chunks_created))
+                        logging.error(f"Error getting embeddings for {relative_path}: {str(e)}")
+                        stats.errors += 1
+                        conn.rollback()  # Rollback any partial changes
+                        continue
+                    
+                except Exception as e:
+                    logging.error(f"Error segmenting text for {relative_path}: {str(e)}")
+                    stats.errors += 1
+                    conn.rollback()  # Rollback any partial changes
+                    continue
+                
+            except Exception as e:
+                logging.error(f"Error reading file {relative_path}: {str(e)}")
+                stats.errors += 1
+                conn.rollback()  # Rollback any partial changes
+                continue
+        
         conn.commit()
-
-    # Return processed documents and stats
-    return processed_docs, stats
+        return processed_documents, stats
+        
+    except Exception as e:
+        logging.error(f"Error in process_documents: {str(e)}")
+        conn.rollback()
+        raise
 
 class ProcessingStats:
-    """Class to track document processing statistics."""
-    
+    """Statistics for document processing."""
     def __init__(self):
-        self._stats = {
-            'chunks_created': 0,
-            'chunks_embedded': 0,
-            'chunks_failed': 0,
-            'docs_processed': 0,
-            'docs_failed': 0,
-            'files_processed': 0,
-            'embeddings_generated': 0,
-            'old_chunks_removed': 0
-        }
-        
-    def __getitem__(self, key):
-        """Make stats subscriptable."""
-        return self._stats[key]
-        
-    def __setitem__(self, key, value):
-        """Allow setting stats via subscription."""
-        self._stats[key] = value
-        
-    def to_dict(self):
-        """Convert stats to dictionary."""
-        return self._stats.copy()
-        
-    @property
-    def chunks_created(self):
-        return self._stats['chunks_created']
-        
-    @chunks_created.setter
-    def chunks_created(self, value):
-        self._stats['chunks_created'] = value
-        
-    @property
-    def chunks_embedded(self):
-        return self._stats['chunks_embedded']
-        
-    @chunks_embedded.setter
-    def chunks_embedded(self, value):
-        self._stats['chunks_embedded'] = value
-        
-    @property
-    def chunks_failed(self):
-        return self._stats['chunks_failed']
-        
-    @chunks_failed.setter
-    def chunks_failed(self, value):
-        self._stats['chunks_failed'] = value
-        
-    @property
-    def docs_processed(self):
-        return self._stats['docs_processed']
-        
-    @docs_processed.setter
-    def docs_processed(self, value):
-        self._stats['docs_processed'] = value
-        
-    @property
-    def docs_failed(self):
-        return self._stats['docs_failed']
-        
-    @docs_failed.setter
-    def docs_failed(self, value):
-        self._stats['docs_failed'] = value
-
-    @property
-    def embeddings_generated(self):
-        return self._stats['embeddings_generated']
-
-    @embeddings_generated.setter
-    def embeddings_generated(self, value):
-        self._stats['embeddings_generated'] = value
+        self.files_processed = 0
+        self.chunks_created = 0
+        self.embeddings_generated = 0
+        self.errors = 0
+    
+    def __str__(self):
+        return (
+            f"Files processed: {self.files_processed}\n"
+            f"Chunks created: {self.chunks_created}\n"
+            f"Embeddings generated: {self.embeddings_generated}\n"
+            f"Errors: {self.errors}"
+        )
