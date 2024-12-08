@@ -1,318 +1,310 @@
 """
 Jina AI Integration Module
 
-This module provides integration with Jina AI services for text processing
-and embedding generation. It handles document segmentation, embedding
-generation, and error recovery.
-
-The module manages:
-- Text segmentation into semantic chunks
-- Embedding generation for chunks
-- Rate limiting and error handling
-- Batch processing optimization
-
-Features:
-- Smart chunking with overlap
-- Configurable chunk sizes
-- Batch processing for efficiency
-- Error recovery and retries
+This module provides a unified interface for all Jina AI services:
+- Text segmentation using o200k_base segmenter
+- Embedding generation using jina-embeddings-v3
+- Batch processing and rate limiting
+- Error handling and retries
 
 Required Environment Variables:
     JINA_API_KEY: API key for Jina AI services
-
-Example:
-    Segment text:
-        chunks = segment_text("Long document text...")
-    
-    Generate embeddings:
-        embeddings = get_embeddings(chunks)
+    JINA_EMBEDDING_MODEL: Embedding model name (default: jina-embeddings-v3)
+    JINA_SEGMENTER_MODEL: Segmenter model name (default: o200k_base)
 """
 
 import os
 import logging
-from typing import List, Dict, Any, Optional
-import time
-from datetime import datetime
 import hashlib
+from datetime import datetime
 import json
+import time
 import requests
+from typing import List, Dict, Any, Optional
+from langchain.schema import Document
+from src.monitoring.metrics import log_api_call
 
-def validate_api_key() -> bool:
-    """
-    Validate the Jina AI API key.
+class JinaAPI:
+    """Unified interface for Jina AI services."""
     
-    Returns:
-        bool: True if API key is valid, False otherwise
-    
-    Raises:
-        EnvironmentError: If API key is missing
-    
-    Example:
-        if validate_api_key():
-            print("API key is valid")
-    """
-    api_key = os.getenv('JINA_API_KEY')
-    if not api_key:
-        raise EnvironmentError("JINA_API_KEY environment variable is required")
-    
-    # TODO: Add actual API key validation when available
-    return True
+    def __init__(self):
+        """Initialize Jina API client with environment variables."""
+        self.api_key = os.environ["JINA_API_KEY"]
+        self.embedding_model = os.environ.get("JINA_EMBEDDING_MODEL", "jina-embeddings-v3")
+        self.segmenter_model = os.environ.get("JINA_SEGMENTER_MODEL", "o200k_base")
+        self.api_logger = logging.getLogger('api_calls')
 
-def segment_text(text: str, api_key: str = None, chunk_size: int = 1000,
-                overlap: int = 100) -> List[Dict[str, Any]]:
-    """
-    Segment text into semantic chunks using Jina AI.
-    
-    Args:
-        text: Input text to segment
-        api_key: Jina AI API key
-        chunk_size: Target size for each chunk
-        overlap: Number of characters to overlap between chunks
-    
-    Returns:
-        List of dictionaries containing:
-        - text: Chunk text content
-        - start: Start position in original text
-        - end: End position in original text
-        - metadata: Additional chunk metadata
-    """
-    api_logger = logging.getLogger('api_calls')
-    request_id = hashlib.md5(f"{datetime.now()}-segment".encode()).hexdigest()[:8]
-    
-    try:
-        # Log API request
-        api_logger.info(json.dumps({
-            'request_id': request_id,
-            'operation': 'segment_text',
-            'text_length': len(text),
-            'chunk_size': chunk_size,
-            'overlap': overlap
-        }))
+    def _log_operation(self, operation: str, details: Dict[str, Any], success: bool = True) -> str:
+        """Log API operations with request ID."""
+        status = "SUCCESS" if success else "FAILED"
+        request_id = hashlib.md5(f"{datetime.now()}-{operation}".encode()).hexdigest()[:8]
         
-        # For testing, return simple chunks if no API key
-        if not api_key:
-            text_length = len(text)
-            
-            # For very short text, return as single chunk
-            if text_length < 100:
-                return [{"text": text, "start": 0, "end": text_length, "metadata": {}}]
-            
-            # For medium text, split into 2 chunks at nearest space
-            elif text_length < 500:
-                mid = text_length // 2
-                # Find nearest space to split
-                while mid > 0 and text[mid] != ' ':
-                    mid -= 1
-                if mid == 0:  # No space found, force split
-                    mid = text_length // 2
-                return [
-                    {"text": text[:mid], "start": 0, "end": mid, "metadata": {}},
-                    {"text": text[mid:], "start": mid, "end": text_length, "metadata": {}}
-                ]
-            
-            # For long text, split into multiple chunks of roughly equal size
-            else:
-                chunks = []
-                num_chunks = 3
-                chunk_size = text_length // num_chunks
-                current_pos = 0
-                for i in range(num_chunks):
-                    end_pos = min(current_pos + chunk_size, text_length)
-                    # Find nearest space to split, unless it's the last chunk
-                    if end_pos < text_length and i < num_chunks - 1:
-                        while end_pos > current_pos and text[end_pos] != ' ':
-                            end_pos -= 1
-                        if end_pos == current_pos:  # No space found, force split
-                            end_pos = min(current_pos + chunk_size, text_length)
-                    chunk = {
-                        "text": text[current_pos:end_pos],
-                        "start": current_pos,
-                        "end": end_pos,
-                        "metadata": {}
-                    }
-                    chunks.append(chunk)
-                    current_pos = end_pos
-                return chunks
+        self.api_logger.info(
+            f"[{request_id}] Jina {operation} {status} - "
+            f"Details: {json.dumps(details)}"
+        )
+        return request_id
+
+    def segment_text(self, text: str, retry_count: int = 3) -> List[Document]:
+        """
+        Segment text into semantic chunks using Jina AI's o200k_base segmenter.
         
-        # Make the API request
-        url = "https://segment.jina.ai/"
+        Args:
+            text: Input text to segment
+            retry_count: Number of retries on failure
+            
+        Returns:
+            List of Document objects containing chunks
+        """
+        start_time = time.time()
+        request_id = self._log_operation("Segmentation", {
+            "text_length": len(text),
+            "model": self.segmenter_model
+        })
+        
+        url = "https://api.jina.ai/v1/segmenter"
         headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
         }
         
-        try:
-            response = requests.post(url, headers=headers, json={
-                'content': text,
-                'tokenizer': "o200k_base",
-                'return_tokens': True,
-                'return_chunks': True,
-                'max_chunk_length': chunk_size
-            })
-            response.raise_for_status()
-            
-            result = response.json()
-            if not isinstance(result, dict):
-                raise ValueError("Invalid response format from Jina API")
-            
-            # For testing, use local chunking if API doesn't return chunks
-            if 'chunks' not in result or not result['chunks']:
-                text_length = len(text)
-                if text_length < 100:
-                    chunks = [{"text": text, "start": 0, "end": text_length, "metadata": {}}]
-                elif text_length < 500:
-                    mid = text_length // 2
-                    while mid > 0 and text[mid] != ' ':
-                        mid -= 1
-                    if mid == 0:
-                        mid = text_length // 2
-                    chunks = [
-                        {"text": text[:mid], "start": 0, "end": mid, "metadata": {}},
-                        {"text": text[mid:], "start": mid, "end": text_length, "metadata": {}}
-                    ]
-                else:
-                    chunks = []
-                    num_chunks = 3
-                    chunk_size = text_length // num_chunks
-                    current_pos = 0
-                    for i in range(num_chunks):
-                        end_pos = min(current_pos + chunk_size, text_length)
-                        # Find nearest space to split, unless it's the last chunk
-                        if end_pos < text_length and i < num_chunks - 1:
-                            while end_pos > current_pos and text[end_pos] != ' ':
-                                end_pos -= 1
-                            if end_pos == current_pos:  # No space found, force split
-                                end_pos = min(current_pos + chunk_size, text_length)
-                        chunk = {
-                            "text": text[current_pos:end_pos],
-                            "start": current_pos,
-                            "end": end_pos,
-                            "metadata": {}
-                        }
-                        chunks.append(chunk)
-                        current_pos = end_pos
-            else:
-                chunks = []
-                for chunk_data in result['chunks']:
-                    if not isinstance(chunk_data, dict):
-                        continue
-                    chunks.append({
-                        'text': chunk_data.get('text', ''),
-                        'start': chunk_data.get('start', 0),
-                        'end': chunk_data.get('end', 0),
-                        'metadata': chunk_data.get('metadata', {})
-                    })
-            
-            api_logger.info(json.dumps({
-                'request_id': request_id,
-                'status': 'success',
-                'chunks_created': len(chunks)
-            }))
-            
-            return chunks
-            
-        except Exception as e:
-            api_logger.error(json.dumps({
-                'request_id': request_id,
-                'status': 'error',
-                'error': str(e)
-            }))
-            raise
-        
-    except Exception as e:
-        api_logger.error(json.dumps({
-            'request_id': request_id,
-            'status': 'error',
-            'error': str(e)
-        }))
-        raise
-
-def get_embeddings(chunks: List[Dict[str, Any]], api_key: str = None,
-                batch_size: int = 50) -> Dict[str, Any]:
-    """
-    Get embeddings for a list of text chunks using Jina AI.
-    
-    Args:
-        chunks: List of text chunks to get embeddings for
-        api_key: Jina AI API key
-        batch_size: Number of chunks to process in each batch
-    
-    Returns:
-        Dictionary containing:
-        - data: List of embeddings with metadata
-        - model: Model used for embeddings
-        - usage: API usage statistics
-    """
-    api_logger = logging.getLogger('api_calls')
-    request_id = hashlib.md5(f"{datetime.now()}-embeddings".encode()).hexdigest()[:8]
-    
-    try:
-        # Log API request
-        api_logger.info(json.dumps({
-            'request_id': request_id,
-            'operation': 'get_embeddings',
-            'chunk_count': len(chunks),
-            'batch_size': batch_size
-        }))
-        
-        # For testing, return mock embeddings if no API key
-        if not api_key:
-            return {
-                "data": [
-                    {
-                        "text": chunk["text"],
-                        "embedding": [0.1, 0.2, 0.3],  # Mock embedding
-                        "embedding_model": "test-model",
-                        "embedding_version": "v1",
-                        "index": i
-                    }
-                    for i, chunk in enumerate(chunks)
-                ],
-                "model": "test-model",
-                "usage": {"total_tokens": 100}
+        payload = {
+            "text": text,
+            "model": self.segmenter_model,
+            "task": "segmentation.document",
+            "options": {
+                "overlap": True,
+                "min_length": 100,
+                "max_length": 2048
             }
+        }
         
-        # Make the API request
+        for attempt in range(retry_count):
+            try:
+                response = requests.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                result = response.json()
+                
+                if not isinstance(result, dict) or 'chunks' not in result:
+                    raise ValueError("Invalid response format from Jina API")
+                
+                chunks = []
+                for i, chunk in enumerate(result['chunks']):
+                    chunks.append(Document(
+                        page_content=chunk['text'],
+                        metadata={
+                            'chunk_number': i,
+                            'total_chunks': len(result['chunks']),
+                            'start': chunk.get('start', 0),
+                            'end': chunk.get('end', len(chunk['text'])),
+                            'model': self.segmenter_model
+                        }
+                    ))
+                
+                log_api_call(
+                    operation="segment_text",
+                    start_time=start_time,
+                    success=True,
+                    details={
+                        "input_length": len(text),
+                        "chunks_created": len(chunks)
+                    }
+                )
+                
+                self._log_operation("Segmentation Success", {
+                    "request_id": request_id,
+                    "chunks_created": len(chunks)
+                })
+                
+                return chunks
+                
+            except Exception as e:
+                if attempt == retry_count - 1:
+                    self._log_operation("Segmentation Failed", {
+                        "request_id": request_id,
+                        "error": str(e),
+                        "attempt": attempt + 1
+                    }, success=False)
+                    raise
+                
+                wait_time = min(2 ** attempt, 60)
+                self.api_logger.warning(
+                    f"[{request_id}] Segmentation failed, retrying in {wait_time}s: {str(e)}"
+                )
+                time.sleep(wait_time)
+
+    def get_embeddings(self, texts: List[str], batch_size: int = 50) -> List[List[float]]:
+        """
+        Generate embeddings for texts using Jina AI's embedding model.
+        
+        Args:
+            texts: List of texts to generate embeddings for
+            batch_size: Number of texts to process in each batch
+            
+        Returns:
+            List of embedding vectors (1024 dimensions each)
+        """
+        start_time = time.time()
+        request_id = self._log_operation("Embeddings", {
+            "total_texts": len(texts),
+            "batch_size": batch_size,
+            "model": self.embedding_model
+        })
+        
         url = "https://api.jina.ai/v1/embeddings"
         headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
         }
         
+        all_embeddings = []
+        
+        # Process in batches
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch_id = f"{request_id}-batch-{i//batch_size + 1}"
+            
+            self.api_logger.info(
+                f"[{batch_id}] Processing batch {i//batch_size + 1}/{(len(texts)-1)//batch_size + 1}"
+            )
+            
+            payload = {
+                "model": self.embedding_model,
+                "input": [str(text).strip() for text in batch],
+                "task": "retrieval.passage",
+                "late_chunking": True,
+                "dimensions": 1024,
+                "embedding_type": "float"
+            }
+            
+            try:
+                response = requests.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                result = response.json()
+                
+                if not isinstance(result, dict) or 'data' not in result:
+                    raise ValueError("Invalid response format from Jina API")
+                
+                batch_embeddings = [item['embedding'] for item in result['data']]
+                
+                # Verify embedding dimensions
+                if batch_embeddings and len(batch_embeddings[0]) != 1024:
+                    raise ValueError(f"Unexpected embedding dimensions: {len(batch_embeddings[0])}")
+                
+                all_embeddings.extend(batch_embeddings)
+                
+                self.api_logger.info(
+                    f"[{batch_id}] Successfully embedded {len(batch)} texts"
+                )
+                
+            except Exception as e:
+                self._log_operation("Embeddings Failed", {
+                    "request_id": request_id,
+                    "batch": i//batch_size + 1,
+                    "error": str(e)
+                }, success=False)
+                raise
+        
+        log_api_call(
+            operation="get_embeddings",
+            start_time=start_time,
+            success=True,
+            details={
+                "texts_count": len(texts),
+                "embeddings_count": len(all_embeddings)
+            }
+        )
+        
+        self._log_operation("Embeddings Success", {
+            "request_id": request_id,
+            "total_embeddings": len(all_embeddings)
+        })
+        
+        return all_embeddings
+
+    def process_document(self, text: str, source: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Process a document through the complete pipeline: segmentation and embedding.
+        
+        Args:
+            text: Document text to process
+            source: Optional source identifier for the document
+            
+        Returns:
+            List of dictionaries containing chunks and their embeddings
+        """
+        start_time = time.time()
+        request_id = self._log_operation("Document Processing", {
+            "text_length": len(text),
+            "source": source
+        })
+        
         try:
-            response = requests.post(url, headers=headers, json={
-                'input': [chunk["text"] for chunk in chunks],
-                'model': 'jina-embeddings-v2-base-en',
-                'instruction': 'Represent this text for semantic search.'
+            # Step 1: Segment text
+            chunks = self.segment_text(text)
+            
+            # Step 2: Generate embeddings
+            chunk_texts = [chunk.page_content for chunk in chunks]
+            embeddings = self.get_embeddings(chunk_texts)
+            
+            # Step 3: Combine results
+            processed_chunks = []
+            for chunk, embedding in zip(chunks, embeddings):
+                metadata = chunk.metadata.copy()
+                if source:
+                    metadata['source'] = source
+                
+                processed_chunks.append({
+                    'content': chunk.page_content,
+                    'embedding': embedding,
+                    'metadata': metadata
+                })
+            
+            log_api_call(
+                operation="process_document",
+                start_time=start_time,
+                success=True,
+                details={
+                    "source": source,
+                    "chunks_processed": len(processed_chunks)
+                }
+            )
+            
+            self._log_operation("Document Processing Success", {
+                "request_id": request_id,
+                "chunks_processed": len(processed_chunks)
             })
-            response.raise_for_status()
             
-            result = response.json()
-            if not isinstance(result, dict) or 'data' not in result:
-                raise ValueError("Invalid response format from Jina API")
-            
-            api_logger.info(json.dumps({
-                'request_id': request_id,
-                'status': 'success',
-                'embeddings_generated': len(result['data'])
-            }))
-            
-            return result
+            return processed_chunks
             
         except Exception as e:
-            api_logger.error(json.dumps({
-                'request_id': request_id,
-                'status': 'error',
-                'error': str(e)
-            }))
+            log_api_call(
+                operation="process_document",
+                start_time=start_time,
+                success=False,
+                details={
+                    "source": source,
+                    "error": str(e)
+                }
+            )
+            self._log_operation("Document Processing Failed", {
+                "request_id": request_id,
+                "error": str(e)
+            }, success=False)
             raise
-        
-    except Exception as e:
-        api_logger.error(json.dumps({
-            'request_id': request_id,
-            'status': 'error',
-            'error': str(e)
-        }))
-        raise
+
+# Create a singleton instance for easy access
+jina_client = JinaAPI()
+
+# Convenience functions that use the singleton instance
+def segment_text(text: str) -> List[Document]:
+    """Convenience function for text segmentation."""
+    return jina_client.segment_text(text)
+
+def get_embeddings(texts: List[str], batch_size: int = 50) -> List[List[float]]:
+    """Convenience function for embedding generation."""
+    return jina_client.get_embeddings(texts, batch_size)
+
+def process_document(text: str, source: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Convenience function for complete document processing."""
+    return jina_client.process_document(text, source)

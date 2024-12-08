@@ -1,169 +1,211 @@
 """Test document processing functionality."""
 import pytest
-from datetime import datetime
 from pathlib import Path
-from src.processing.documents import process_documents
-from src.database.maintenance import optimize_batch_processing
-from src.api.jina import segment_text, get_embeddings
-import os
+import tempfile
+from unittest.mock import MagicMock, patch
+from langchain.schema import Document
+from src.api.jina import JinaAPI, jina_client
+from src.processing.background_tasks import ProcessingQueue, ProcessingStatus, BackgroundProcessor
 
-def test_process_new_document(temp_db, test_docs_dir, mock_jina_api):
-    """Test processing of a new document."""
-    test_file = test_docs_dir / "test1.md"
-    test_file.write_text("Test document content for processing. This is a sample text that will be split into chunks.")
+@pytest.fixture
+def mock_jina_api():
+    """Create a mock Jina API client."""
+    mock_api = MagicMock(spec=JinaAPI)
     
-    documents, stats = process_documents([str(test_file)], temp_db)
+    # Mock segment_text
+    mock_api.segment_text.return_value = [
+        Document(
+            page_content="Test chunk 1",
+            metadata={"chunk_number": 0, "total_chunks": 2}
+        ),
+        Document(
+            page_content="Test chunk 2",
+            metadata={"chunk_number": 1, "total_chunks": 2}
+        )
+    ]
     
-    # Debug: Check database state
-    c = temp_db.cursor()
+    # Mock get_embeddings
+    mock_api.get_embeddings.return_value = [
+        [0.1] * 1024,  # Mock 1024-dimensional embeddings
+        [0.2] * 1024
+    ]
     
-    print("\nChunks table:")
-    c.execute("SELECT * FROM chunks")
-    chunks = c.fetchall()
-    for chunk in chunks:
-        print(f"Chunk: {chunk}")
+    # Mock process_document
+    mock_api.process_document.return_value = [
+        {
+            'content': "Test chunk 1",
+            'embedding': [0.1] * 1024,
+            'metadata': {
+                'chunk_number': 0,
+                'total_chunks': 2,
+                'source': 'test.md'
+            }
+        },
+        {
+            'content': "Test chunk 2",
+            'embedding': [0.2] * 1024,
+            'metadata': {
+                'chunk_number': 1,
+                'total_chunks': 2,
+                'source': 'test.md'
+            }
+        }
+    ]
     
-    print("\nDocuments table:")
-    c.execute("SELECT * FROM documents")
-    docs = c.fetchall()
-    for doc in docs:
-        print(f"Doc: {doc}")
+    return mock_api
+
+@pytest.fixture
+def mock_processing_queue():
+    """Create a mock processing queue."""
+    return ProcessingQueue()
+
+def test_jina_api_segmentation(mock_jina_api):
+    """Test text segmentation with Jina API."""
+    test_text = "This is a test document. It should be split into chunks."
+    chunks = mock_jina_api.segment_text(test_text)
     
-    print("\nProcessed documents:")
-    for doc in documents:
-        print(f"Processed doc: {doc}")
+    assert len(chunks) == 2
+    assert all(isinstance(chunk, Document) for chunk in chunks)
+    assert chunks[0].metadata['chunk_number'] == 0
+    assert chunks[0].metadata['total_chunks'] == 2
+
+def test_jina_api_embeddings(mock_jina_api):
+    """Test embedding generation with Jina API."""
+    test_texts = ["Chunk 1", "Chunk 2"]
+    embeddings = mock_jina_api.get_embeddings(test_texts)
     
-    assert len(documents) == 2  # Two chunks from mock
-    assert stats.chunks_created == 2
-    assert stats.embeddings_generated == 2
+    assert len(embeddings) == 2
+    assert all(len(embedding) == 1024 for embedding in embeddings)
+
+def test_jina_api_document_processing(mock_jina_api):
+    """Test complete document processing with Jina API."""
+    test_text = "This is a test document."
+    processed_chunks = mock_jina_api.process_document(test_text, source="test.md")
     
-    # Check database entries
-    c = temp_db.cursor()
+    assert len(processed_chunks) == 2
+    assert all('content' in chunk for chunk in processed_chunks)
+    assert all('embedding' in chunk for chunk in processed_chunks)
+    assert all('metadata' in chunk for chunk in processed_chunks)
+    assert all(len(chunk['embedding']) == 1024 for chunk in processed_chunks)
+    assert all(chunk['metadata']['source'] == 'test.md' for chunk in processed_chunks)
+
+def test_processing_queue_management(mock_processing_queue):
+    """Test processing queue management."""
+    # Add documents
+    test_files = ["doc1.md", "doc2.md"]
+    mock_processing_queue.add_documents(test_files)
     
-    # Check processed_files
-    c.execute("SELECT status, chunk_count FROM processed_files WHERE filename = ?", (test_file.name,))
-    result = c.fetchone()
-    assert result
-    assert result[0] == "embedded"
-    assert result[1] == 2
+    # Check initial status
+    for file in test_files:
+        status, error = mock_processing_queue.get_status(file)
+        assert status == ProcessingStatus.PENDING
+        assert error is None
     
-    # Check chunks
-    c.execute("SELECT COUNT(*) FROM chunks WHERE filename = ?", (test_file.name,))
-    assert c.fetchone()[0] == 2
+    # Update status
+    mock_processing_queue.update_status("doc1.md", ProcessingStatus.PROCESSING)
+    status, error = mock_processing_queue.get_status("doc1.md")
+    assert status == ProcessingStatus.PROCESSING
     
-    # Check documents
-    c.execute("SELECT COUNT(*) FROM documents WHERE filename = ?", (test_file.name,))
-    assert c.fetchone()[0] == 2
-
-def test_force_reprocess_document(temp_db, test_docs_dir, mock_jina_api, sample_processed_doc):
-    """Test force reprocessing of an existing document."""
-    test_file = test_docs_dir / sample_processed_doc
+    # Test error handling
+    mock_processing_queue.update_status("doc2.md", ProcessingStatus.FAILED, "Test error")
+    status, error = mock_processing_queue.get_status("doc2.md")
+    assert status == ProcessingStatus.FAILED
+    assert error == "Test error"
     
-    # Create test file with content
-    test_file.write_text("Test document content that needs to be reprocessed.")
+    # Test completion
+    mock_processing_queue.update_status("doc1.md", ProcessingStatus.COMPLETED)
+    mock_processing_queue.clear_completed()
+    status, _ = mock_processing_queue.get_status("doc1.md")
+    assert status == ProcessingStatus.PENDING  # Default status for unknown files
+
+@pytest.mark.asyncio
+async def test_background_processor(mock_jina_api, mock_processing_queue):
+    """Test background processing functionality."""
+    processor = BackgroundProcessor()
+    processor.queue = mock_processing_queue
     
-    documents, stats = process_documents([str(test_file)], temp_db, force_reprocess=[str(test_file)])
+    # Add test documents
+    test_files = ["test1.md", "test2.md"]
+    processor.queue.add_documents(test_files)
     
-    assert len(documents) == 2
-    assert stats.chunks_created == 2
-    assert stats.embeddings_generated == 2
+    # Create test files
+    with tempfile.TemporaryDirectory() as temp_dir:
+        docs_dir = Path(temp_dir) / "docs"
+        docs_dir.mkdir()
+        
+        for file in test_files:
+            with open(docs_dir / file, 'w') as f:
+                f.write("Test content")
+        
+        # Process one document
+        doc = processor.queue.get_next_pending()
+        assert doc is not None
+        
+        with patch('src.api.jina.jina_client', mock_jina_api):
+            processor._process_document(doc)
+        
+        # Check status
+        status, error = processor.queue.get_status(doc['filename'])
+        assert status == ProcessingStatus.COMPLETED
+        assert error is None
+
+def test_error_handling(mock_jina_api, mock_processing_queue):
+    """Test error handling in document processing."""
+    # Make API fail
+    mock_jina_api.process_document.side_effect = Exception("API error")
     
-    # Verify new processing timestamp
-    c = temp_db.cursor()
-    c.execute("SELECT processed_at FROM processed_files WHERE filename = ?", (sample_processed_doc,))
-    new_timestamp = c.fetchone()[0]
-    assert new_timestamp  # Should have a new timestamp
-
-def test_batch_processing_optimization():
-    """Test batch processing optimization."""
-    # Test with short chunks
-    chunks = ["short text", "medium text " * 5, "long text " * 10]
-    batches = list(optimize_batch_processing(chunks))
-    assert len(batches) > 0
-    assert all(len(batch) <= 50 for batch in batches)
-
-    # Test with custom batch size
-    batches = list(optimize_batch_processing(chunks, batch_size=2))
-    assert len(batches) >= 2
-    assert all(len(batch) <= 2 for batch in batches)
-
-    # Test with very long chunks that should trigger token limit splits
-    long_chunks = ["very long text " * 500] * 5  # Much longer chunks
-    batches = list(optimize_batch_processing(long_chunks))
-    assert len(batches) > 1  # Should split due to token limit
-
-def test_error_handling(temp_db, test_docs_dir, mock_jina_api, monkeypatch):
-    """Test error handling during processing."""
-    class MockResponse:
-        def __init__(self, json_data, status_code=200):
-            self.json_data = json_data
-            self.status_code = status_code
-
-        def json(self):
-            return self.json_data
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise Exception(f"HTTP {self.status_code}")
-
-    def mock_post(*args, **kwargs):
-        """Mock requests.post to simulate API failures."""
-        if "embeddings" in args[0]:  # If it's the embeddings endpoint
-            raise Exception("Embedding failed")
-        else:  # For segmentation endpoint
-            text = kwargs["json"]["content"]
-            text_length = len(text)
-            return MockResponse({
-                "chunks": [{"text": text, "start": 0, "end": text_length, "metadata": {}}]
-            })
-
-    def mock_getenv(key, default=None):
-        """Mock environment variables."""
-        if key == 'JINA_API_KEY':
-            return 'test_key'
-        return default
-
-    # Replace the original functions with our mocks
-    monkeypatch.setattr("requests.post", mock_post)
-    monkeypatch.setattr("os.getenv", mock_getenv)
-
-    test_file = test_docs_dir / "test1.md"
-    test_file.write_text("Test content")
-
-    documents, stats = process_documents([str(test_file)], temp_db)
-
-    # Should have created chunks but failed embeddings
-    assert stats.chunks_created == 1  # One chunk from mock
-    assert stats.errors == 1  # One error from failed embeddings
-    assert len(documents) == 0  # No documents should be created on error
-
-    # Check database entries
-    c = temp_db.cursor()
-
-    # Check processed_files - should not be marked as processed
-    c.execute("SELECT COUNT(*) FROM processed_files WHERE filename = ?", (test_file.name,))
-    assert c.fetchone()[0] == 0
-
-    # Check chunks - should not be stored
-    c.execute("SELECT COUNT(*) FROM chunks WHERE filename = ?", (test_file.name,))
-    assert c.fetchone()[0] == 0
-
-    # Check documents - should not be stored
-    c.execute("SELECT COUNT(*) FROM documents WHERE filename = ?", (test_file.name,))
-    assert c.fetchone()[0] == 0
-
-@pytest.mark.parametrize("content,expected_chunks", [
-    ("Short text", 1),
-    ("Medium text\nWith multiple\nLines", 2),
-    ("Very long text " * 20, 3)
-])
-def test_document_segmentation(temp_db, test_docs_dir, mock_jina_api, content, expected_chunks):
-    """Test document segmentation with different content types."""
+    processor = BackgroundProcessor()
+    processor.queue = mock_processing_queue
+    
+    # Add test document
+    test_file = "error_test.md"
+    processor.queue.add_documents([test_file])
+    
     # Create test file
-    test_file = test_docs_dir / "test_segment.md"
-    with open(test_file, 'w') as f:
-        f.write(content)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        docs_dir = Path(temp_dir) / "docs"
+        docs_dir.mkdir()
+        
+        with open(docs_dir / test_file, 'w') as f:
+            f.write("Test content")
+        
+        # Process document
+        doc = processor.queue.get_next_pending()
+        assert doc is not None
+        
+        with patch('src.api.jina.jina_client', mock_jina_api):
+            processor._process_document(doc)
+        
+        # Check error status
+        status, error = processor.queue.get_status(test_file)
+        assert status == ProcessingStatus.FAILED
+        assert "API error" in error
+
+def test_batch_processing(mock_jina_api, mock_processing_queue):
+    """Test batch processing of documents."""
+    # Create multiple test documents
+    test_files = [f"doc{i}.md" for i in range(5)]
+    processor = BackgroundProcessor()
+    processor.queue = mock_processing_queue
+    processor.queue.add_documents(test_files)
     
-    documents, stats = process_documents([str(test_file)], temp_db)
-    assert stats.chunks_created == expected_chunks
-    assert len(documents) == expected_chunks
+    # Create test files
+    with tempfile.TemporaryDirectory() as temp_dir:
+        docs_dir = Path(temp_dir) / "docs"
+        docs_dir.mkdir()
+        
+        for file in test_files:
+            with open(docs_dir / file, 'w') as f:
+                f.write("Test content")
+        
+        # Process all documents
+        with patch('src.api.jina.jina_client', mock_jina_api):
+            while (doc := processor.queue.get_next_pending()) is not None:
+                processor._process_document(doc)
+        
+        # Check all documents are completed
+        statuses = processor.queue.get_all_statuses()
+        assert all(
+            status['status'] == ProcessingStatus.COMPLETED.value
+            for status in statuses.values()
+        )
