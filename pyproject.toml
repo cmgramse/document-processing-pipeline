@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "document-processing"
+version = "0.1.0"
+description = "Document processing pipeline with Jina and Qdrant"
+authors = [{ name = "Your Name", email = "your.email@example.com" }]
+requires-python = ">=3.8"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.pylance]
+reportMissingImports = "warning"
+pythonPath = "src"
+
+[tool.pyright]
+include = ["src"]
+exclude = ["**/node_modules", "**/__pycache__"]
+pythonVersion = "3.8"
+pythonPath = "src"
+typeCheckingMode = "basic" 

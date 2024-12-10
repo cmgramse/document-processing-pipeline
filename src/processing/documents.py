@@ -80,8 +80,8 @@ from tqdm import tqdm
 from langchain.schema import Document
 from ..api.jina import segment_text, get_embeddings
 from ..database.operations import mark_file_as_processed, get_unprocessed_files, force_reprocess_files
-from .stats import ProcessingStats
 from src.database.maintenance import optimize_batch_processing, track_chunk_versions
+from .stats import ProcessingStats
 
 class Document:
     """Represents a processed document with its content and metadata."""
@@ -93,156 +93,65 @@ class Document:
         return f"Document(content={self.page_content[:50]}..., metadata={self.metadata})"
 
 def list_available_documents() -> List[str]:
-    """
-    List all available documents in the docs directory.
+    """List all available documents in the configured documents directory"""
+    # Get documents path from environment or use default, make it absolute
+    docs_path = Path(os.getenv('DOCUMENTS_PATH', 'docs')).resolve()
     
-    This function recursively scans the docs directory for supported document types,
-    validates their accessibility, and returns relative paths for processing.
-    
-    Supported File Types:
-    - Markdown (.md)
-    - Text (.txt)
-    - reStructuredText (.rst)
-    
-    Returns:
-        List[str]: List of relative paths to available documents
-    
-    Raises:
-        Exception: If docs directory doesn't exist
-        PermissionError: If files are not readable
-    
-    Example:
-        # List all available documents
-        docs = list_available_documents()
-        print(f"Found {len(docs)} documents:")
-        for doc in docs:
-            print(f"- {doc}")
-            
-        # Filter specific file types
-        md_docs = [doc for doc in docs if doc.endswith('.md')]
-        print(f"Found {len(md_docs)} markdown documents")
-    """
-    """List all available documents in the docs directory"""
-    docs_path = Path('./docs')
     if not docs_path.exists():
-        raise Exception("The docs directory does not exist")
+        raise Exception(f"The documents directory does not exist: {docs_path}")
     
     available_docs = []
-    allowed_extensions = {'.md', '.txt', '.rst'}  # Add supported file types
+    allowed_extensions = {'.md', '.txt', '.rst'}
+    
+    print(f"\nDocument directory: {docs_path}\n")
     
     # Using Path.rglob instead of os.walk for better path handling
     for file_path in docs_path.rglob('*'):
         if file_path.is_file() and file_path.suffix in allowed_extensions:
-            relative_path = file_path.relative_to(docs_path)
-            available_docs.append(str(relative_path))
+            # Store tuple of (display_name, full_path)
+            available_docs.append((file_path.name, str(file_path)))
         elif file_path.is_file():
             logging.warning(f"Skipping unsupported file type: {file_path}")
     
     if not available_docs:
-        logging.warning("No supported documents found in docs directory")
+        logging.warning(f"No supported documents found in directory: {docs_path}")
     
     return sorted(available_docs)
 
-def select_documents(available_docs: List[str]) -> List[str]:
-    """
-    Interactive document selection interface.
-    
-    Provides a user-friendly interface for selecting documents to process,
-    supporting various selection methods and validation.
-    
-    Selection Methods:
-    1. Individual selection: "1, 3, 5"
-    2. Range selection: "1-5"
-    3. All documents: "all"
-    
-    Args:
-        available_docs: List of available document paths
-    
-    Returns:
-        List[str]: Selected document paths
-    
-    Raises:
-        Exception: If no documents are available
-        ValueError: If invalid selection is made
-    
-    Example:
-        # List and select documents
-        docs = list_available_documents()
-        selected = select_documents(docs)
-        
-        # Process selection
-        print("Selected documents:")
-        for doc in selected:
-            print(f"- {doc}")
-            
-        # Validate specific documents
-        if 'important.md' in selected:
-            print("Processing important document...")
-    """
-    """Interactive document selection"""
+def select_documents(available_docs: List[tuple]) -> List[str]:
+    """Interactive document selection interface."""
     if not available_docs:
         raise Exception("No documents found in the docs directory")
         
     print("Available documents:")
-    for idx, doc in enumerate(available_docs, 1):
-        print(f"{idx}. {doc}")
+    for idx, (display_name, _) in enumerate(available_docs, 1):
+        print(f"{idx}. {display_name}")
     
     while True:
         selection = input("\nEnter document numbers to process (comma-separated) or 'all' for all documents: ").strip()
         if selection.lower() == 'all':
-            return available_docs
+            return [full_path for _, full_path in available_docs]
         
         try:
             selected_indices = [int(idx.strip()) - 1 for idx in selection.split(',')]
-            selected_docs = [available_docs[idx] for idx in selected_indices if 0 <= idx < len(available_docs)]
+            selected_docs = [available_docs[idx][1] for idx in selected_indices if 0 <= idx < len(available_docs)]
             if selected_docs:
                 return selected_docs
             print("No valid documents selected. Please try again.")
         except (ValueError, IndexError):
             print("Invalid input. Please enter numbers separated by commas or 'all'")
 
-def create_document_objects(processed_chunks: List[Dict[str, Any]]) -> List[Document]:
+def create_document_objects(processed_chunks: List[Dict[str, Any]], stats: ProcessingStats) -> List[Document]:
     """
     Convert processed chunks into LangChain Document objects.
     
-    This function transforms raw processed chunks into structured Document objects,
-    preserving metadata and embeddings for downstream processing.
-    
     Args:
-        processed_chunks: List of dictionaries containing:
-            - content: str, The chunk text content
-            - metadata: dict, Associated metadata
-            - token_count: int, Number of tokens
-            - embedding: List[float], Vector embedding
-    
-    Returns:
-        List[Document]: LangChain Document objects with:
-            - page_content: Original text
-            - metadata: Enhanced with token count and embedding
-    
-    Raises:
-        ValueError: If chunk format is invalid
-        TypeError: If embedding format is incorrect
-    
-    Example:
-        # Process chunks into documents
-        chunks = [
-            {
-                "content": "Sample text",
-                "metadata": {"source": "doc.md"},
-                "token_count": 2,
-                "embedding": [0.1, 0.2, 0.3]
-            }
-        ]
-        docs = create_document_objects(chunks)
+        processed_chunks: List of dictionaries containing chunk data
+        stats: ProcessingStats instance for tracking
         
-        # Access document properties
-        for doc in docs:
-            print(f"Content: {doc.page_content}")
-            print(f"Source: {doc.metadata['source']}")
-            print(f"Embedding size: {len(doc.metadata['embedding'])}")
+    Returns:
+        List of Document objects
     """
-    """Convert processed chunks into LangChain Document objects"""
     api_logger = logging.getLogger('api_calls')
     request_id = hashlib.md5(f"{datetime.now()}-convert".encode()).hexdigest()[:8]
     
@@ -258,14 +167,16 @@ def create_document_objects(processed_chunks: List[Dict[str, Any]]) -> List[Docu
                 metadata={
                     **chunk["metadata"],
                     "token_count": chunk["token_count"],
-                    "embedding": chunk["embedding"]  # Store embedding in metadata
+                    "embedding": chunk["embedding"]
                 }
             )
             documents.append(doc)
+            stats.track_db_operation('chunk_convert')
         except Exception as e:
             api_logger.error(
                 f"[{request_id}] Error converting chunk {i}: {str(e)}"
             )
+            stats.track_db_operation('chunk_convert', error=str(e))
             raise
     
     api_logger.info(
@@ -273,193 +184,280 @@ def create_document_objects(processed_chunks: List[Dict[str, Any]]) -> List[Docu
     )
     return documents
 
-def segment_text_local(text: str, api_key: Optional[str] = None) -> List[Dict[str, Any]]:
+def segment_text_local(text: str, api_key: Optional[str] = None, stats: Optional[ProcessingStats] = None) -> List[Dict[str, Any]]:
     """
     Segment text into chunks using a language model.
     
     Args:
         text: Text to segment
         api_key: Optional API key for the language model
+        stats: Optional ProcessingStats instance for tracking
         
     Returns:
-        List of dictionaries containing chunk information:
-        - text: The chunk text
-        - start: Starting position in original text
-        - end: Ending position in original text
-        - metadata: Additional metadata
+        List of dictionaries containing chunk information
     """
-    # For testing, return simple chunks if no API key
-    if not api_key:
-        text_length = len(text)
-        
-        # For very short text, return as single chunk
-        if text_length < 100:
-            return [{"text": text, "start": 0, "end": text_length, "metadata": {}}]
-        
-        # For medium text, split into 2 chunks at nearest space
-        elif text_length < 500:
-            mid = text_length // 2
-            # Find nearest space to split
-            while mid > 0 and text[mid] != ' ':
-                mid -= 1
-            if mid == 0:  # No space found, force split
-                mid = text_length // 2
-            return [
-                {"text": text[:mid], "start": 0, "end": mid, "metadata": {}},
-                {"text": text[mid:], "start": mid, "end": text_length, "metadata": {}}
-            ]
-        
-        # For long text, split into multiple chunks of roughly equal size
-        else:
-            chunks = []
-            num_chunks = 3
-            chunk_size = text_length // num_chunks
-            current_pos = 0
-            for i in range(num_chunks):
-                end_pos = min(current_pos + chunk_size, text_length)
-                # Find nearest space to split, unless it's the last chunk
-                if end_pos < text_length and i < num_chunks - 1:
-                    while end_pos > current_pos and text[end_pos] != ' ':
-                        end_pos -= 1
-                    if end_pos == current_pos:  # No space found, force split
-                        end_pos = min(current_pos + chunk_size, text_length)
-                chunk = {
-                    "text": text[current_pos:end_pos],
-                    "start": current_pos,
-                    "end": end_pos,
-                    "metadata": {}
-                }
-                chunks.append(chunk)
-                current_pos = end_pos
-            return chunks
+    start_time = datetime.now()
     
-    # Use the Jina AI segmentation API
-    return segment_text(text, api_key)
+    try:
+        # For testing, return simple chunks if no API key
+        if not api_key:
+            text_length = len(text)
+            
+            # For very short text, return as single chunk
+            if text_length < 100:
+                chunks = [{"text": text, "start": 0, "end": text_length, "metadata": {}}]
+            # For medium text, split into 2 chunks at nearest space
+            elif text_length < 500:
+                mid = text_length // 2
+                while mid > 0 and text[mid] != ' ':
+                    mid -= 1
+                if mid == 0:
+                    mid = text_length // 2
+                chunks = [
+                    {"text": text[:mid], "start": 0, "end": mid, "metadata": {}},
+                    {"text": text[mid:], "start": mid, "end": text_length, "metadata": {}}
+                ]
+            # For long text, split into multiple chunks
+            else:
+                chunks = []
+                num_chunks = 3
+                chunk_size = text_length // num_chunks
+                current_pos = 0
+                for i in range(num_chunks):
+                    end_pos = min(current_pos + chunk_size, text_length)
+                    if end_pos < text_length and i < num_chunks - 1:
+                        while end_pos > current_pos and text[end_pos] != ' ':
+                            end_pos -= 1
+                        if end_pos == current_pos:
+                            end_pos = min(current_pos + chunk_size, text_length)
+                    chunk = {
+                        "text": text[current_pos:end_pos],
+                        "start": current_pos,
+                        "end": end_pos,
+                        "metadata": {}
+                    }
+                    chunks.append(chunk)
+                    current_pos = end_pos
+            
+            if stats:
+                stats.track_api_call('jina_chunking', success=True, 
+                                   latency=(datetime.now() - start_time).total_seconds())
+            return chunks
+        
+        # Use the Jina AI segmentation API
+        try:
+            chunks = segment_text(text, api_key)
+            if stats:
+                stats.track_api_call('jina_chunking', success=True, 
+                                   latency=(datetime.now() - start_time).total_seconds())
+            return chunks
+        except Exception as e:
+            if stats:
+                stats.track_api_call('jina_chunking', success=False, 
+                                   latency=(datetime.now() - start_time).total_seconds(),
+                                   error=str(e))
+            raise
+            
+    except Exception as e:
+        if stats:
+            stats.track_api_call('jina_chunking', success=False, 
+                               latency=(datetime.now() - start_time).total_seconds(),
+                               error=str(e))
+        raise
 
 def process_documents(markdown_files: List[str], conn, force_reprocess: List[str] = None) -> Tuple[List[Document], ProcessingStats]:
     """Process markdown documents and generate embeddings."""
     stats = ProcessingStats()
+    stats.start()
     processed_documents = []
     
     try:
-        # Get unprocessed files
+        # Check for duplicate documents first
+        from ..database.operations import check_document_exists
+        duplicates = []
+        for file_path in markdown_files:
+            doc_status = check_document_exists(conn, file_path)
+            if doc_status:
+                print(f"\nDocument already exists: {file_path}")
+                print(f"Status: {doc_status['status']}")
+                print(f"Last processed: {doc_status['processed_at']}")
+                print(f"Chunks: {doc_status['completed_chunks']}/{doc_status['total_chunks']}")
+                
+                while True:
+                    choice = input("Do you want to: [r]eprocess this document, [s]kip it, or [c]ancel processing? ").lower()
+                    if choice in ['r', 's', 'c']:
+                        break
+                    print("Invalid choice. Please enter 'r', 's', or 'c'")
+                
+                if choice == 'c':
+                    print("Processing cancelled.")
+                    return processed_documents, stats
+                elif choice == 'r':
+                    if not force_reprocess:
+                        force_reprocess = []
+                    force_reprocess.append(file_path)
+                else:  # skip
+                    duplicates.append(file_path)
+        
+        # Remove skipped duplicates from processing list
+        markdown_files = [f for f in markdown_files if f not in duplicates]
+        if not markdown_files and not force_reprocess:
+            print("No documents to process after handling duplicates.")
+            return processed_documents, stats
+            
+        # Get unprocessed files - these should now be full paths
         unprocessed_files = get_unprocessed_files(conn, markdown_files)
         if force_reprocess:
             force_reprocess_files(conn, force_reprocess)
-            # Only add files that aren't already in unprocessed_files
             unprocessed_files.extend([f for f in force_reprocess if f not in unprocessed_files])
         
         # Track versions for chunks
         track_chunk_versions(conn)
         
-        docs_path = Path('./docs')
-        for relative_path in unprocessed_files:
+        total_files = len(unprocessed_files)
+        for file_idx, file_path in enumerate(unprocessed_files, 1):
             try:
-                file_path = docs_path / relative_path
+                # Convert string path to Path object
+                file_path = Path(file_path)
+                logging.info(f"Processing file {file_idx} of {total_files}: {file_path}")
+                
+                if not file_path.exists():
+                    logging.error(f"File not found: {file_path}")
+                    stats.errors += 1
+                    continue
+                    
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 
                 try:
                     # Segment text into chunks
-                    segments = segment_text(content, api_key=os.getenv('JINA_API_KEY', ''))
-                    if not segments:
-                        logging.warning(f"No segments generated for {relative_path}")
+                    logging.info(f"Segmenting text for {file_path}")
+                    chunks = segment_text_local(content, stats=stats)
+                    if not chunks:
+                        logging.warning(f"No segments generated for {file_path}")
                         continue
-                    
-                    logging.debug(f"Segmented chunks: {segments}")
-                    stats.chunks_created += len(segments)
-                    
-                    # Process chunks and get embeddings
-                    chunk_texts = [chunk["text"] for chunk in segments]
-                    try:
-                        embeddings_result = get_embeddings(segments, api_key=os.getenv('JINA_API_KEY', ''))
                         
-                        if not embeddings_result or "data" not in embeddings_result:
-                            logging.error(f"Failed to get embeddings for {relative_path}")
-                            stats.errors += 1
-                            conn.rollback()  # Rollback any partial changes
-                            continue
-                        
-                        # Store chunks in database
-                        c = conn.cursor()
-                        for i, (chunk, embedding_data) in enumerate(zip(segments, embeddings_result["data"])):
-                            chunk_id = hashlib.md5(chunk["text"].encode()).hexdigest()
-                            basename = os.path.basename(str(file_path))
+                    logging.info(f"Generated {len(chunks)} chunks for {file_path}")
+                    stats.update(chunks_created=len(chunks))
+                    
+                    # Store chunks in database with pending status
+                    c = conn.cursor()
+                    basename = os.path.basename(str(file_path))
+                    
+                    for i, chunk in enumerate(chunks):
+                        try:
+                            # Get the actual content from the chunk
+                            chunk_content = chunk.page_content if hasattr(chunk, 'page_content') else str(chunk)
                             
-                            # Store chunk
+                            # Generate IDs using the content
+                            chunk_id = hashlib.md5(chunk_content.encode()).hexdigest()
+                            content_hash = hashlib.md5(chunk_content.encode()).hexdigest()
+                            
+                            # Store chunk with pending status and proper chunk number
                             c.execute('''INSERT OR REPLACE INTO chunks 
-                                       (id, filename, content, token_count, embedding_status)
-                                       VALUES (?, ?, ?, ?, ?)''',
+                                       (id, filename, content, chunk_number, content_hash, 
+                                        token_count, embedding_status, chunking_status)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                                      (chunk_id,
                                       basename,
-                                      chunk["text"],
-                                      len(chunk["text"].split()),  # Simple token count
+                                      chunk_content,
+                                      i,  # Use loop index as chunk_number
+                                      content_hash,
+                                      len(chunk_content.split()),  # Simple token count
+                                      "pending",
                                       "completed"))
                             
-                            # Store document with embedding
+                            # Create placeholder document record
                             c.execute('''INSERT OR REPLACE INTO documents 
-                                       (id, filename, chunk_id, content, embedding, processed_at)
-                                       VALUES (?, ?, ?, ?, ?, datetime('now'))''',
-                                     (chunk_id,
+                                       (id, filename, chunk_id, content, processed_at, status, chunking_status)
+                                       VALUES (?, ?, ?, ?, datetime('now'), ?, ?)''',
+                                     (hashlib.md5(basename.encode()).hexdigest(),
                                       basename,
                                       i,
-                                      chunk["text"],
-                                      json.dumps(embedding_data["embedding"])))
+                                      chunk_content,
+                                      "processing",
+                                      "completed"))
                             
-                            # Create Document object
-                            doc = Document(
-                                page_content=chunk["text"],
-                                metadata={
-                                    "source": basename,
-                                    "chunk_id": i,
-                                    "embedding": embedding_data["embedding"]
-                                }
-                            )
-                            processed_documents.append(doc)
-                            stats.embeddings_generated += 1
+                            stats.track_db_operation('chunk_insert')
+                            
+                        except Exception as e:
+                            logging.error(f"Error storing chunk {i} for {file_path}: {str(e)}")
+                            stats.track_db_operation('chunk_insert', error=str(e))
+                            raise
+                    
+                    # Update processed_files table
+                    try:
+                        c.execute('''INSERT OR REPLACE INTO processed_files 
+                                   (filename, processed_at, chunk_count, status, chunking_status)
+                                   VALUES (?, datetime('now'), ?, ?, ?)''',
+                                 (basename, len(chunks), "processing", "completed"))
                         
-                        # Mark file as processed
-                        mark_file_as_processed(conn, basename, len(segments))
-                        stats.files_processed += 1
+                        conn.commit()
+                        stats.update(files_processed=1)
+                        stats.track_db_operation('file_status_update')
+                        logging.info(f"Successfully chunked {file_path} into {len(chunks)} segments")
                         
                     except Exception as e:
-                        logging.error(f"Error getting embeddings for {relative_path}: {str(e)}")
-                        stats.errors += 1
-                        conn.rollback()  # Rollback any partial changes
-                        continue
+                        logging.error(f"Error updating processed_files for {file_path}: {str(e)}")
+                        stats.track_db_operation('file_status_update', error=str(e))
+                        conn.rollback()
+                        raise
                     
                 except Exception as e:
-                    logging.error(f"Error segmenting text for {relative_path}: {str(e)}")
+                    logging.error(f"Error processing file {file_path}: {str(e)}")
                     stats.errors += 1
-                    conn.rollback()  # Rollback any partial changes
+                    conn.rollback()
                     continue
-                
+                    
             except Exception as e:
-                logging.error(f"Error reading file {relative_path}: {str(e)}")
+                logging.error(f"Error reading file {file_path}: {str(e)}")
                 stats.errors += 1
-                conn.rollback()  # Rollback any partial changes
                 continue
+                
+        # Process any pending chunks
+        try:
+            from ..database.operations import process_pending_chunks
+            logging.info("Processing pending chunks...")
+            processed_count, error_count = process_pending_chunks(conn)
+            stats.update(embeddings_generated=processed_count)
+            stats.errors += error_count
+            logging.info(f"Finished processing chunks: {processed_count} processed, {error_count} errors")
+        except Exception as e:
+            logging.error(f"Error processing pending chunks: {str(e)}")
+            stats.errors += 1
+                
+    except Exception as e:
+        logging.error(f"Error processing documents: {str(e)}")
+        stats.errors += 1
+    
+    finally:
+        stats.end()
         
-        conn.commit()
-        return processed_documents, stats
+    return processed_documents, stats
+
+def chunk_document(doc_path: str) -> Tuple[List[str], List[int]]:
+    """
+    Chunk a document into segments using Jina AI segmenter.
+    
+    Args:
+        doc_path: Path to the document
+        
+    Returns:
+        Tuple of (list of chunk texts, list of token counts)
+    """
+    try:
+        # Read document
+        with open(doc_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Segment text
+        chunks = segment_text(content)
+        
+        # Calculate token counts (simple word-based count)
+        token_counts = [len(chunk.split()) for chunk in chunks]
+        
+        return chunks, token_counts
         
     except Exception as e:
-        logging.error(f"Error in process_documents: {str(e)}")
-        conn.rollback()
+        logging.error(f"Failed to chunk document {doc_path}: {e}")
         raise
-
-class ProcessingStats:
-    """Statistics for document processing."""
-    def __init__(self):
-        self.files_processed = 0
-        self.chunks_created = 0
-        self.embeddings_generated = 0
-        self.errors = 0
-    
-    def __str__(self):
-        return (
-            f"Files processed: {self.files_processed}\n"
-            f"Chunks created: {self.chunks_created}\n"
-            f"Embeddings generated: {self.embeddings_generated}\n"
-            f"Errors: {self.errors}"
-        )

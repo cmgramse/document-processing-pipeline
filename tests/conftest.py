@@ -24,31 +24,36 @@ def temp_db():
     # Create test schema
     c = conn.cursor()
     
-    # Create chunks table
-    c.execute('''CREATE TABLE chunks
-                 (id TEXT PRIMARY KEY,
-                  filename TEXT,
-                  content TEXT,
-                  token_count INTEGER,
-                  embedding_status TEXT DEFAULT 'pending',
-                  processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  version INTEGER DEFAULT 1)''')
-    
     # Create documents table
-    c.execute('''CREATE TABLE documents
-                 (id TEXT PRIMARY KEY,
-                  filename TEXT,
-                  chunk_id INTEGER,
-                  content TEXT,
-                  embedding TEXT,
-                  processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS documents
+                (id TEXT PRIMARY KEY,
+                 filename TEXT,
+                 chunk_id INTEGER,
+                 content TEXT,
+                 embedding TEXT,
+                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 status TEXT DEFAULT 'pending',
+                 qdrant_status TEXT DEFAULT 'pending')''')
+    
+    # Create chunks table
+    c.execute('''CREATE TABLE IF NOT EXISTS chunks
+                (id TEXT PRIMARY KEY,
+                 filename TEXT,
+                 content TEXT,
+                 token_count INTEGER,
+                 embedding_status TEXT DEFAULT 'pending',
+                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 chunk_number INTEGER,
+                 content_hash TEXT,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 version INTEGER DEFAULT 1)''')
     
     # Create processed_files table
-    c.execute('''CREATE TABLE processed_files
-                 (filename TEXT PRIMARY KEY,
-                  processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  chunk_count INTEGER,
-                  status TEXT DEFAULT 'pending')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS processed_files
+                (filename TEXT PRIMARY KEY,
+                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 chunk_count INTEGER,
+                 status TEXT DEFAULT 'pending')''')
     
     conn.commit()
     

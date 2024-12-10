@@ -1,0 +1,36 @@
+{
+  "jina": {
+    "api_key": "your_jina_api_key_here",
+    "embedding_model": "jina-embeddings-v3",
+    "segmenter_model": "o200k_base",
+    "embedding_dimension": 1024,
+    "max_input_tokens": 8000
+  },
+  "qdrant": {
+    "api_key": "your_qdrant_api_key_here",
+    "url": "your_qdrant_url_here",
+    "collection_name": "your_collection_name",
+    "vector_size": 1024,
+    "distance": "cosine",
+    "optimize_segment_number": 2,
+    "optimize_indexing_threshold": 20000,
+    "optimize_memmap_threshold": 10000
+  },
+  "processing": {
+    "batch_size": 50,
+    "max_tokens_per_batch": 8000,
+    "late_chunking": true,
+    "max_retries": 3,
+    "retry_delay": 5,
+    "memory_threshold": 80,
+    "min_free_memory_mb": 500
+  },
+  "validation": {
+    "max_document_size_mb": 10,
+    "min_document_size_bytes": 50,
+    "max_chunk_size": 2000,
+    "min_chunk_size": 100,
+    "supported_file_types": [".md", ".txt"],
+    "duplicate_threshold": 0.95
+  }
+} 

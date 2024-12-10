@@ -1,258 +1,180 @@
 """
-Database Initialization Module
-
-This module handles SQLite database initialization and schema management for
-the document management system. It ensures the database structure is properly
-set up and maintained, including handling schema migrations and upgrades.
-
-The module manages:
-- Database connection and initialization
-- Schema creation and updates
-- Index management
-- Database maintenance
-
-Database Schema:
-    documents:
-        - id: Primary key
-        - filepath: Document path
-        - status: Processing status
-        - created_at: Creation timestamp
-        - updated_at: Last update timestamp
-        - metadata: JSON metadata
-        - qdrant_status: Vector upload status
-    
-    chunks:
-        - id: Primary key
-        - document_id: Foreign key to documents
-        - content: Chunk text content
-        - metadata: JSON metadata
-        - created_at: Creation timestamp
-        - embedding: Vector embedding
-        - version: Schema version
-
-Example:
-    Initialize database:
-        conn = initialize_database()
-    
-    Create test database:
-        conn = create_test_database()
+Database initialization and setup module.
 """
 
 import sqlite3
 import logging
-from datetime import datetime
 from pathlib import Path
-from typing import Optional
+import os
 
-def get_database_path(test: bool = False) -> Path:
+def init_database(db_path: str) -> None:
     """
-    Get the path to the SQLite database file.
+    Initialize the SQLite database with proper schema.
     
     Args:
-        test: Whether to return test database path
-    
-    Returns:
-        Path: Database file path
-    
-    Example:
-        db_path = get_database_path()
-        print(f"Using database at: {db_path}")
+        db_path: Path to the database file
     """
-    if test:
-        return Path('./data/test.db')
-    return Path('./data/documents.db')
-
-def initialize_database(test: bool = False) -> sqlite3.Connection:
-    """
-    Initialize the SQLite database with required schema.
-    
-    Args:
-        test: Whether to initialize test database
-    
-    Returns:
-        sqlite3.Connection: Database connection
-    
-    The function:
-    1. Creates database file if not exists
-    2. Creates required tables
-    3. Sets up indexes
-    4. Performs any needed migrations
-    
-    Example:
-        conn = initialize_database()
-        try:
-            # Use database
-            pass
-        finally:
-            conn.close()
-    """
-    db_path = get_database_path(test)
-    db_path.parent.mkdir(exist_ok=True)
-    
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    
+    # Ensure directory exists
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+        
     try:
-        create_schema(conn)
-        create_indexes(conn)
-        perform_migrations(conn)
+        # Connect to database
+        conn = sqlite3.connect(db_path)
+        
+        # Enable foreign keys
+        conn.execute("PRAGMA foreign_keys = ON")
+        
+        # Set journal mode to WAL for better concurrency
+        conn.execute("PRAGMA journal_mode = WAL")
+        
+        # Set synchronous mode to NORMAL for better performance while maintaining safety
+        conn.execute("PRAGMA synchronous = NORMAL")
+        
+        # Read and execute schema
+        schema_path = Path(__file__).parent / 'schema.sql'
+        with open(schema_path, 'r') as f:
+            schema = f.read()
+            
+        # Split schema into individual statements and execute each one
+        statements = schema.split(';')
+        for statement in statements:
+            if statement.strip():
+                try:
+                    conn.execute(statement)
+                except sqlite3.OperationalError as e:
+                    if "already exists" not in str(e):
+                        raise
+                        
         conn.commit()
+        logging.info(f"Database initialized at {db_path}")
+        
     except Exception as e:
-        conn.close()
-        raise Exception(f"Failed to initialize database: {str(e)}")
-    
-    return conn
-
-def create_schema(conn: sqlite3.Connection) -> None:
-    """
-    Create database schema if not exists.
-    
-    Args:
-        conn: SQLite database connection
-    
-    Creates tables:
-    - documents: Document metadata and status
-    - chunks: Document chunks and embeddings
-    - migrations: Schema version tracking
-    
-    Example:
-        create_schema(conn)
-    """
-    c = conn.cursor()
-    
-    # Documents table
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS documents (
-        id INTEGER PRIMARY KEY,
-        filepath TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        metadata TEXT,
-        qdrant_status TEXT DEFAULT 'pending'
-    )
-    ''')
-    
-    # Chunks table
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS chunks (
-        id INTEGER PRIMARY KEY,
-        document_id INTEGER NOT NULL,
-        content TEXT NOT NULL,
-        metadata TEXT,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        embedding BLOB,
-        version INTEGER NOT NULL DEFAULT 1,
-        FOREIGN KEY (document_id) REFERENCES documents(id)
-    )
-    ''')
-    
-    # Migrations table
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS migrations (
-        id INTEGER PRIMARY KEY,
-        version INTEGER NOT NULL,
-        applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-
-def create_indexes(conn: sqlite3.Connection) -> None:
-    """
-    Create database indexes for performance optimization.
-    
-    Args:
-        conn: SQLite database connection
-    
-    Creates indexes on:
-    - document filepath and status
-    - chunk document_id and version
-    - migration version
-    
-    Example:
-        create_indexes(conn)
-    """
-    c = conn.cursor()
-    
-    # Document indexes
-    c.execute('''
-    CREATE INDEX IF NOT EXISTS idx_documents_filepath
-    ON documents(filepath)
-    ''')
-    
-    c.execute('''
-    CREATE INDEX IF NOT EXISTS idx_documents_status
-    ON documents(status)
-    ''')
-    
-    # Chunk indexes
-    c.execute('''
-    CREATE INDEX IF NOT EXISTS idx_chunks_document
-    ON chunks(document_id)
-    ''')
-    
-    c.execute('''
-    CREATE INDEX IF NOT EXISTS idx_chunks_version
-    ON chunks(version)
-    ''')
-
-def perform_migrations(conn: sqlite3.Connection) -> None:
-    """
-    Perform any pending database migrations.
-    
-    Args:
-        conn: SQLite database connection
-    
-    The function:
-    1. Checks current schema version
-    2. Applies any pending migrations
-    3. Updates schema version
-    
-    Example:
-        perform_migrations(conn)
-    """
-    c = conn.cursor()
-    
-    # Get current version
-    c.execute('SELECT MAX(version) FROM migrations')
-    current_version = c.fetchone()[0] or 0
-    
-    # Apply migrations
-    migrations = [
-        # Add new migrations here
-        # (version, migration_sql)
-    ]
-    
-    for version, migration_sql in migrations:
-        if version > current_version:
-            try:
-                c.execute(migration_sql)
-                c.execute(
-                    'INSERT INTO migrations (version) VALUES (?)',
-                    (version,)
-                )
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                raise Exception(f"Migration {version} failed: {str(e)}")
-
-def create_test_database() -> sqlite3.Connection:
-    """
-    Create a temporary test database.
-    
-    Returns:
-        sqlite3.Connection: Test database connection
-    
-    The function creates an isolated database for testing with:
-    - Same schema as production
-    - Empty tables
-    - In-memory when possible
-    
-    Example:
-        conn = create_test_database()
-        try:
-            # Run tests
-            pass
-        finally:
+        logging.error(f"Error initializing database: {str(e)}")
+        raise
+    finally:
+        if conn:
             conn.close()
+
+def get_connection(db_path: str) -> sqlite3.Connection:
     """
-    return initialize_database(test=True)
+    Get a database connection with proper settings.
+    
+    Args:
+        db_path: Path to the database file
+        
+    Returns:
+        SQLite connection object
+    """
+    try:
+        # Connect to database
+        conn = sqlite3.connect(db_path)
+        
+        # Set row factory for better column access
+        conn.row_factory = sqlite3.Row
+        
+        # Enable foreign keys
+        conn.execute("PRAGMA foreign_keys = ON")
+        
+        # Set journal mode to WAL for better concurrency
+        conn.execute("PRAGMA journal_mode = WAL")
+        
+        # Set synchronous mode to NORMAL for better performance while maintaining safety
+        conn.execute("PRAGMA synchronous = NORMAL")
+        
+        return conn
+        
+    except Exception as e:
+        logging.error(f"Error connecting to database: {str(e)}")
+        raise
+
+def check_database(db_path: str) -> bool:
+    """
+    Check if database exists and has proper schema.
+    
+    Args:
+        db_path: Path to the database file
+        
+    Returns:
+        True if database is valid
+    """
+    if not os.path.exists(db_path):
+        return False
+        
+    try:
+        conn = get_connection(db_path)
+        c = conn.cursor()
+        
+        # Check for required tables
+        required_tables = {
+            'documents',
+            'chunks',
+            'processed_files',
+            'document_references',
+            'processing_queue',
+            'processing_history'
+        }
+        
+        c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        existing_tables = {row[0] for row in c.fetchall()}
+        
+        # Check if all required tables exist
+        missing_tables = required_tables - existing_tables
+        if missing_tables:
+            logging.error(f"Missing tables: {missing_tables}")
+            return False
+            
+        # Check for required columns in chunks table
+        c.execute("PRAGMA table_info(chunks)")
+        columns = {row[1] for row in c.fetchall()}
+        
+        required_columns = {
+            'id',
+            'filename',
+            'content',
+            'token_count',
+            'chunk_number',
+            'content_hash',
+            'chunking_status',
+            'embedding_status',
+            'qdrant_status',
+            'embedding',
+            'qdrant_id',
+            'processed_at',
+            'created_at',
+            'last_verified_at',
+            'error_message',
+            'version'
+        }
+        
+        missing_columns = required_columns - columns
+        if missing_columns:
+            logging.error(f"Missing columns in chunks table: {missing_columns}")
+            return False
+            
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error checking database: {str(e)}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def initialize_if_needed(db_path: str) -> None:
+    """
+    Initialize database if it doesn't exist or is invalid.
+    
+    Args:
+        db_path: Path to the database file
+    """
+    try:
+        if not check_database(db_path):
+            logging.info(f"Initializing database at {db_path}")
+            init_database(db_path)
+        else:
+            logging.info(f"Database at {db_path} is valid")
+    except Exception as e:
+        logging.error(f"Error initializing database: {str(e)}")
+        raise

@@ -16,6 +16,7 @@ from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict
 import threading
 from collections import defaultdict
+from pathlib import Path
 
 @dataclass
 class APIMetrics:
@@ -70,19 +71,21 @@ class MetricsCollector:
         self.api_metrics = defaultdict(APIMetrics)
         self.processing_metrics = ProcessingMetrics()
         self._lock = threading.Lock()
-        self._setup_logging()
-    
-    def _setup_logging(self):
-        """Set up metrics logging."""
         self.logger = logging.getLogger('metrics')
-        self.logger.setLevel(logging.INFO)
         
-        # Add metrics file handler
-        metrics_handler = logging.FileHandler('metrics.log')
-        metrics_handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        )
-        self.logger.addHandler(metrics_handler)
+        # Ensure logs directory exists
+        log_dir = Path('./logs')
+        log_dir.mkdir(exist_ok=True)
+        
+        # Add metrics file handler if not already added
+        if not any(isinstance(h, logging.FileHandler) for h in self.logger.handlers):
+            metrics_handler = logging.FileHandler(log_dir / 'metrics.log', mode='a')
+            metrics_handler.setFormatter(
+                logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            )
+            self.logger.addHandler(metrics_handler)
+            self.logger.setLevel(logging.INFO)
+            self.logger.propagate = False  # Prevent duplicate logging
     
     def log_api_call(self, 
                      operation: str,

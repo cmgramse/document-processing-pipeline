@@ -1,13 +1,13 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="document_pipeline",
-    version="0.1",
+    name="jupyter-upserting-pipeline",
+    version="0.1.0",
     packages=find_packages(),
     install_requires=[
-        "langchain",
-        "qdrant-client",
-        "tqdm",
-        "pytest",
+        line.strip()
+        for line in open("requirements.txt")
+        if line.strip() and not line.startswith("#")
     ],
+    python_requires=">=3.12",
 )

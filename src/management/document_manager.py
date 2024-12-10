@@ -1,248 +1,336 @@
-"""Document management functionality for handling document lifecycle."""
-import logging
-import os
-from typing import List, Tuple, Optional
-from datetime import datetime
-import hashlib
-from pathlib import Path
+"""
+Document Manager Module
 
-from ..database.operations import get_database_stats
-from ..api.qdrant import delete_vectors_by_filter
+Handles document operations using the new schema:
+- Document creation and updates
+- Status tracking
+- Processing queue management
+- History tracking
+"""
+
+import os
+import uuid
+import json
+import logging
+import hashlib
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+import sqlite3
+
+logger = logging.getLogger(__name__)
 
 class DocumentManager:
-    def __init__(self, conn, qdrant_client=None):
-        self.conn = conn
-        self.qdrant_client = qdrant_client
-        self.collection_name = os.getenv('QDRANT_COLLECTION_NAME')
+    """Manages document operations with the new schema."""
     
-    def check_document_exists(self, filename: str) -> Tuple[bool, Optional[str]]:
+    def __init__(self, db_path: str):
+        """Initialize with database path."""
+        self.db_path = db_path
+        
+    def _get_db(self) -> sqlite3.Connection:
+        """Get database connection with proper configuration."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+        
+    def create_document(self, filename: str, content: str, metadata: Optional[Dict] = None) -> str:
         """
-        Check if document exists and its status.
-        Returns (exists, status)
+        Create a new document record.
+        
+        Args:
+            filename: Document filename
+            content: Document content
+            metadata: Optional metadata
+            
+        Returns:
+            Document ID
         """
-        c = self.conn.cursor()
-        c.execute("SELECT status FROM processed_files WHERE filename = ?", (filename,))
-        result = c.fetchone()
-        return (True, result[0]) if result else (False, None)
-    
-    def delete_document(self, filename: str, force: bool = False) -> bool:
-        """Delete a document and its associated chunks."""
-        try:
-            c = self.conn.cursor()
+        doc_id = hashlib.md5(filename.encode()).hexdigest()
+        
+        with self._get_db() as conn:
+            # Create document
+            conn.execute("""
+                INSERT INTO documents (
+                    id, filename, content, status, metadata
+                ) VALUES (?, ?, ?, 'pending', ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    content = excluded.content,
+                    status = 'pending',
+                    metadata = excluded.metadata,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (doc_id, filename, content, json.dumps(metadata or {})))
             
-            # Get all chunk IDs for the document
-            c.execute("SELECT id FROM chunks WHERE filename = ?", (filename,))
-            chunk_ids = [row[0] for row in c.fetchall()]
+            # Create initial processing task
+            task_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO processing_queue (
+                    id, document_id, task_type, status
+                ) VALUES (?, ?, 'chunk', 'pending')
+            """, (task_id, doc_id))
             
-            # Get all document IDs in Qdrant
-            c.execute("SELECT id FROM documents WHERE chunk_id IN ({})".format(
-                ','.join('?' * len(chunk_ids))), chunk_ids)
-            doc_ids = [row[0] for row in c.fetchall()]
+        return doc_id
+        
+    def create_chunk(self, doc_id: str, chunk_id: str, content: str,
+                    chunk_index: int, token_count: int, qdrant_id: str) -> bool:
+        """
+        Create a new chunk record.
+        
+        Args:
+            doc_id: Parent document ID
+            chunk_id: Chunk ID (UUID)
+            content: Chunk content
+            chunk_index: Position in document
+            token_count: Number of tokens
+            qdrant_id: Pre-generated Qdrant ID
             
-            if not force:
-                # Check if document is referenced elsewhere
-                c.execute("""
-                    SELECT name FROM sqlite_master 
-                    WHERE type='table' AND name='document_references'
-                """)
-                if c.fetchone():
-                    c.execute("""
-                        SELECT COUNT(*) FROM document_references 
-                        WHERE source_doc_id IN (
-                            SELECT id FROM documents WHERE filename = ?
-                        ) OR target_doc_id IN (
-                            SELECT id FROM documents WHERE filename = ?
-                        )
-                    """, (filename, filename))
-                    ref_count = c.fetchone()[0]
-                    if ref_count > 0:
-                        logging.warning(f"Document {filename} has {ref_count} references")
-                        if not force:
-                            return False
+        Returns:
+            True if successful
+        """
+        with self._get_db() as conn:
+            conn.execute("""
+                INSERT INTO chunks (
+                    id, document_id, content, chunk_index,
+                    token_count, qdrant_id, status
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            """, (chunk_id, doc_id, content, chunk_index, token_count, qdrant_id))
+            return True
             
-            # Delete from Qdrant
-            if self.qdrant_client and doc_ids:
-                self.qdrant_client.delete_vectors_by_filter({"must": [{"id": {"in": doc_ids}}]})
+    def update_chunk(self, chunk_id: str, status: Optional[str] = None,
+                    embedding: Optional[List[float]] = None,
+                    error: Optional[str] = None) -> bool:
+        """
+        Update chunk record.
+        
+        Args:
+            chunk_id: Chunk ID
+            status: New status
+            embedding: Vector embedding
+            error: Error message
             
-            # Delete document references if table exists
-            c.execute("""
-                SELECT name FROM sqlite_master 
-                WHERE type='table' AND name='document_references'
-            """)
-            if c.fetchone():
-                c.execute("""
-                    DELETE FROM document_references 
-                    WHERE source_doc_id IN (
-                        SELECT id FROM documents WHERE filename = ?
-                    ) OR target_doc_id IN (
-                        SELECT id FROM documents WHERE filename = ?
-                    )
-                """, (filename, filename))
+        Returns:
+            True if successful
+        """
+        with self._get_db() as conn:
+            updates = []
+            params = []
+            
+            if status is not None:
+                updates.append("status = ?")
+                params.append(status)
                 
-            # Delete from documents
-            c.execute("DELETE FROM documents WHERE chunk_id IN ({})".format(
-                ','.join('?' * len(chunk_ids))), chunk_ids)
-            
-            # Delete from chunks
-            c.execute("DELETE FROM chunks WHERE filename = ?", (filename,))
-            
-            # Delete from processed_files
-            c.execute("DELETE FROM processed_files WHERE filename = ?", (filename,))
-            
-            self.conn.commit()
-            logging.info(f"Successfully deleted document {filename} and all associated data")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error deleting document {filename}: {str(e)}")
-            self.conn.rollback()
-            return False
-    
-    def select_documents(self, available_docs: List[str], selection: str) -> List[str]:
-        """
-        Select documents based on various input formats:
-        - Individual numbers: "1,3,5"
-        - Ranges: "1-5"
-        - Combinations: "1,3-5,7"
-        - All: "all"
-        - Latest: "latest:N"
-        """
-        if not selection or not available_docs:
-            return []
-            
-        selection = selection.lower().strip()
-        selected = set()
-        
-        # Handle 'all' case
-        if selection == 'all':
-            return available_docs
-            
-        # Handle 'latest:N' case
-        if selection.startswith('latest:'):
-            try:
-                n = int(selection.split(':')[1])
-                return available_docs[-n:]
-            except (IndexError, ValueError):
-                logging.warning("Invalid 'latest:N' format, falling back to manual selection")
-        
-        # Handle individual numbers and ranges
-        for part in selection.split(','):
-            part = part.strip()
-            try:
-                if '-' in part:
-                    start, end = map(int, part.split('-'))
-                    if 1 <= start <= end <= len(available_docs):
-                        selected.update(range(start-1, end))
-                else:
-                    idx = int(part) - 1
-                    if 0 <= idx < len(available_docs):
-                        selected.add(idx)
-            except ValueError:
-                logging.warning(f"Invalid selection part: {part}")
-                continue
-        
-        return [available_docs[i] for i in sorted(selected)]
-    
-    def handle_existing_document(self, filename: str) -> bool:
-        """
-        Handle an existing document. Returns True if should process.
-        """
-        exists, status = self.check_document_exists(filename)
-        if not exists:
-            return True
-            
-        print(f"\nDocument '{filename}' already exists with status: {status}")
-        choice = input("Options:\n1. Reprocess (delete and upload again)\n2. Skip\n3. Force update\nChoice (1-3): ")
-        
-        if choice == '1':
-            if self.delete_document(filename):
+            if embedding is not None:
+                updates.append("embedding = ?")
+                params.append(json.dumps(embedding))
+                
+            if error is not None:
+                updates.append("error_message = ?")
+                params.append(error)
+                
+            if updates:
+                updates.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(chunk_id)
+                
+                conn.execute(f"""
+                    UPDATE chunks
+                    SET {', '.join(updates)}
+                    WHERE id = ?
+                """, params)
                 return True
-            print("Failed to delete existing document, skipping...")
             return False
-        elif choice == '3':
+            
+    def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        """Get document by ID."""
+        with self._get_db() as conn:
+            row = conn.execute("""
+                SELECT 
+                    d.*,
+                    COUNT(DISTINCT c.id) as chunk_count,
+                    COUNT(DISTINCT CASE WHEN c.status = 'completed' THEN c.id END) as completed_chunks
+                FROM documents d
+                LEFT JOIN chunks c ON c.document_id = d.id
+                WHERE d.id = ?
+                GROUP BY d.id
+            """, (doc_id,)).fetchone()
+            
+            if row:
+                doc = dict(row)
+                doc['metadata'] = json.loads(doc['metadata']) if doc['metadata'] else {}
+                return doc
+            return None
+            
+    def get_document_by_filename(self, filename: str) -> Optional[Dict[str, Any]]:
+        """Get document by filename."""
+        with self._get_db() as conn:
+            row = conn.execute("""
+                SELECT 
+                    d.*,
+                    COUNT(DISTINCT c.id) as chunk_count,
+                    COUNT(DISTINCT CASE WHEN c.status = 'completed' THEN c.id END) as completed_chunks
+                FROM documents d
+                LEFT JOIN chunks c ON c.document_id = d.id
+                WHERE d.filename = ?
+                GROUP BY d.id
+            """, (filename,)).fetchone()
+            
+            if row:
+                doc = dict(row)
+                doc['metadata'] = json.loads(doc['metadata']) if doc['metadata'] else {}
+                return doc
+            return None
+            
+    def update_document_status(self, doc_id: str, status: str, error: Optional[str] = None) -> bool:
+        """Update document status."""
+        with self._get_db() as conn:
+            conn.execute("""
+                UPDATE documents 
+                SET status = ?,
+                    error_message = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (status, error, doc_id))
             return True
-        else:  # choice 2 or invalid
-            return False
-    
-    def batch_process_documents(self, available_docs: List[str]) -> List[str]:
-        """
-        Interactive document selection with advanced options.
-        """
-        while True:
-            print("\nAvailable documents:")
-            for idx, doc in enumerate(available_docs, 1):
-                print(f"{idx}. {doc}")
             
-            print("\nSelection options:")
-            print("- Individual numbers: 1,3,5")
-            print("- Ranges: 1-5")
-            print("- Combinations: 1,3-5,7")
-            print("- All documents: all")
-            print("- Latest N documents: latest:N")
-            print("- Press Enter to finish selection")
+    def get_document_chunks(self, doc_id: str) -> List[Dict[str, Any]]:
+        """Get all chunks for a document."""
+        with self._get_db() as conn:
+            rows = conn.execute("""
+                SELECT *
+                FROM chunks
+                WHERE document_id = ?
+                ORDER BY chunk_index
+            """, (doc_id,)).fetchall()
             
-            selection = input("\nEnter your selection: ")
-            if not selection:
-                break
-                
-            selected = self.select_documents(available_docs, selection)
-            if selected:
-                return selected
+            chunks = []
+            for row in rows:
+                chunk = dict(row)
+                chunk['embedding'] = json.loads(chunk['embedding']) if chunk['embedding'] else None
+                chunks.append(chunk)
+            return chunks
+            
+    def get_pending_tasks(self, task_type: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get pending processing tasks."""
+        with self._get_db() as conn:
+            query = """
+                SELECT q.*, d.filename
+                FROM processing_queue q
+                JOIN documents d ON d.id = q.document_id
+                WHERE q.status = 'pending'
+            """
+            
+            if task_type:
+                query += " AND q.task_type = ?"
+                rows = conn.execute(query + " ORDER BY q.priority DESC, q.created_at LIMIT ?",
+                    (task_type, limit)).fetchall()
             else:
-                print("Invalid selection, please try again")
-        
-        return []
-
-    def get_document_stats(self, filename: str) -> dict:
-        """
-        Get detailed statistics for a document.
-        """
-        c = self.conn.cursor()
-        stats = {}
-        
-        # Get basic file info
-        c.execute("SELECT status, chunk_count, processed_at FROM processed_files WHERE filename = ?", 
-                 (filename,))
-        result = c.fetchone()
-        if result:
-            stats.update({
-                "status": result[0],
-                "chunk_count": result[1],
-                "processed_at": result[2]
-            })
-        
-        # Get chunk stats
-        c.execute("""
-            SELECT 
-                COUNT(*) as total_chunks,
-                SUM(CASE WHEN embedding_status = 'completed' THEN 1 ELSE 0 END) as completed_chunks,
-                SUM(CASE WHEN embedding_status = 'failed' THEN 1 ELSE 0 END) as failed_chunks,
-                AVG(token_count) as avg_tokens
-            FROM chunks 
-            WHERE filename = ?
-        """, (filename,))
-        chunk_stats = c.fetchone()
-        if chunk_stats:
-            stats.update({
-                "total_chunks": chunk_stats[0],
-                "completed_chunks": chunk_stats[1],
-                "failed_chunks": chunk_stats[2],
-                "avg_tokens_per_chunk": round(chunk_stats[3], 2) if chunk_stats[3] else 0
-            })
-        
-        # Get Qdrant stats
-        c.execute("""
-            SELECT 
-                COUNT(*) as total_vectors,
-                SUM(CASE WHEN status = 'uploaded' THEN 1 ELSE 0 END) as uploaded_vectors
-            FROM documents 
-            WHERE filename = ?
-        """, (filename,))
-        vector_stats = c.fetchone()
-        if vector_stats:
-            stats.update({
-                "total_vectors": vector_stats[0],
-                "uploaded_vectors": vector_stats[1]
-            })
-        
-        return stats
+                rows = conn.execute(query + " ORDER BY q.priority DESC, q.created_at LIMIT ?",
+                    (limit,)).fetchall()
+                
+            return [dict(row) for row in rows]
+            
+    def update_task_status(self, task_id: str, status: str, error: Optional[str] = None) -> bool:
+        """Update task status."""
+        with self._get_db() as conn:
+            conn.execute("""
+                UPDATE processing_queue
+                SET status = ?,
+                    error_message = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (status, error, task_id))
+            return True
+            
+    def add_processing_history(self, doc_id: str, action: str, 
+                             chunk_id: Optional[str] = None,
+                             details: Optional[Dict] = None) -> bool:
+        """Add processing history entry."""
+        with self._get_db() as conn:
+            conn.execute("""
+                INSERT INTO processing_history (
+                    document_id, chunk_id, action, status, details
+                ) VALUES (?, ?, ?, 'success', ?)
+            """, (doc_id, chunk_id, action, json.dumps(details or {})))
+            return True
+            
+    def get_processing_history(self, doc_id: str) -> List[Dict[str, Any]]:
+        """Get processing history for a document."""
+        with self._get_db() as conn:
+            rows = conn.execute("""
+                SELECT *
+                FROM processing_history
+                WHERE document_id = ?
+                ORDER BY created_at DESC
+            """, (doc_id,)).fetchall()
+            
+            history = []
+            for row in rows:
+                entry = dict(row)
+                entry['details'] = json.loads(entry['details']) if entry['details'] else {}
+                history.append(entry)
+            return history
+            
+    def cleanup_failed_tasks(self, max_retries: int = 3) -> int:
+        """Clean up failed tasks and reset for retry."""
+        with self._get_db() as conn:
+            # Get failed tasks under retry limit
+            rows = conn.execute("""
+                UPDATE processing_queue
+                SET status = 'pending',
+                    retry_count = retry_count + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'failed'
+                AND retry_count < ?
+                RETURNING id
+            """, (max_retries,)).fetchall()
+            
+            # Mark permanently failed tasks
+            conn.execute("""
+                UPDATE processing_queue
+                SET status = 'permanent_failure',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'failed'
+                AND retry_count >= ?
+            """, (max_retries,))
+            
+            return len(rows)
+            
+    def get_processing_stats(self) -> Dict[str, Any]:
+        """Get processing statistics."""
+        with self._get_db() as conn:
+            stats = {}
+            
+            # Document stats
+            doc_stats = conn.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
+                    COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
+                    COUNT(CASE WHEN status = 'error' THEN 1 END) as failed
+                FROM documents
+            """).fetchone()
+            stats['documents'] = dict(doc_stats)
+            
+            # Chunk stats
+            chunk_stats = conn.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
+                    COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
+                    COUNT(CASE WHEN status = 'error' THEN 1 END) as failed
+                FROM chunks
+            """).fetchone()
+            stats['chunks'] = dict(chunk_stats)
+            
+            # Queue stats
+            queue_stats = conn.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
+                    COUNT(CASE WHEN status = 'processing' THEN 1 END) as processing,
+                    COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
+                    COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed,
+                    COUNT(CASE WHEN status = 'permanent_failure' THEN 1 END) as permanent_failures
+                FROM processing_queue
+            """).fetchone()
+            stats['queue'] = dict(queue_stats)
+            
+            return stats
